@@ -64,6 +64,39 @@ function Test-Port {
     finally { $client.Close() }
 }
 
+function Save-Backup {
+    # Preserve the current contents of a file before it is overwritten, under a
+    # name that does not already exist: .bak, then .bak.1, .bak.2, ...
+    #
+    # Two rules, both learned the hard way:
+    #   * Never reuse a name. A plain `Copy-Item -Force` onto a fixed ".bak"
+    #     silently replaces the first backup on the next install - and after a
+    #     user has edited a file twice, the first backup is the only copy of the
+    #     original they have left.
+    #   * Copy to a ".partial" name and only then move it into place, so an
+    #     interrupted copy can never leave a truncated file that LOOKS like a
+    #     complete backup. If the copy fails, nothing of the user's is lost: the
+    #     destination has not been touched yet and the earlier backups are intact.
+    param([string]$Path)
+
+    $candidate = "$Path.bak"
+    $n = 0
+    while (Test-Path -LiteralPath $candidate) {
+        $n++
+        $candidate = "$Path.bak.$n"
+    }
+    $temp = "$candidate.partial"
+    try {
+        Copy-Item -LiteralPath $Path -Destination $temp -Force
+        Move-Item -LiteralPath $temp -Destination $candidate -Force
+    }
+    catch {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    return $candidate
+}
+
 function Install-File {
     param([string]$From, [string]$To, [string]$Label)
     $dir = Split-Path -Parent $To
@@ -71,9 +104,9 @@ function Install-File {
     if (Test-Path -LiteralPath $To) {
         $same = (Get-FileHash -LiteralPath $From).Hash -eq (Get-FileHash -LiteralPath $To).Hash
         if ($same) { Say ("  = {0}" -f $Label); return }
-        Copy-Item -LiteralPath $To -Destination "$To.bak" -Force
+        $backup = Save-Backup -Path $To
         Copy-Item -LiteralPath $From -Destination $To -Force
-        Say ("  ~ {0}  (previous version saved as .bak)" -f $Label) 'Yellow'
+        Say ("  ~ {0}  (previous version saved as {1})" -f $Label, (Split-Path -Leaf $backup)) 'Yellow'
     }
     else {
         Copy-Item -LiteralPath $From -Destination $To -Force
@@ -91,8 +124,20 @@ function Install-Tree {
     # Copy-Item -Force over an identical file still rewrites it, which makes a
     # running Godot editor rescan the whole addon for nothing - so "unchanged"
     # has to mean untouched, not merely "same hash afterwards".
+    #
+    # A file that differs is the user's, or an older upstream, and either way it is
+    # backed up before it is replaced. This used to overwrite in place with no
+    # backup at all - the one path where an upgrade could destroy a hand-edited
+    # handler permanently.
+    #
+    # Stale files are left alone, deliberately. A file that no longer exists
+    # upstream may be a handler the user added, and this function cannot tell an
+    # integration-owned file from a user file - both are plain .gd files in one
+    # tree. Deleting them needs an explicit manifest and its own tested decision,
+    # not a silent delete here.
     $copied = 0
     $kept = 0
+    $backups = 0
     foreach ($source in Get-ChildItem -LiteralPath $From -Recurse -File) {
         $rel = $source.FullName.Substring($From.Length).TrimStart('\')
         $dest = Join-Path $To $rel
@@ -104,6 +149,8 @@ function Install-Tree {
                 $kept++
                 continue
             }
+            $null = Save-Backup -Path $dest
+            $backups++
             Copy-Item -LiteralPath $source.FullName -Destination $dest -Force
             $copied++
         }
@@ -115,7 +162,9 @@ function Install-Tree {
 
     if (-not $existed) { Say ("  + {0}" -f $Label) 'Green'; return }
     if ($copied -eq 0) { Say ("  = {0}" -f $Label); return }
-    Say ("  ~ {0}  ({1} file(s) updated, {2} unchanged)" -f $Label, $copied, $kept) 'Yellow'
+    $detail = "{0} file(s) updated, {1} unchanged" -f $copied, $kept
+    if ($backups -gt 0) { $detail += ", {0} backed up as .bak" -f $backups }
+    Say ("  ~ {0}  ({1})" -f $Label, $detail) 'Yellow'
 }
 
 # ---------------------------------------------------------------- preflight

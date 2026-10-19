@@ -106,8 +106,14 @@ commands\game.md                  /game, a thin wrapper over the skill
 godot-mcp-addon\godot_mcp\        pinned addon copy used for new projects
 ```
 
-Re-running the installer is safe: identical files are left alone, changed ones are
-backed up to `.bak` first. `.\uninstall.cmd` reverses it and keeps your journal.
+Re-running the installer is safe: identical files are left alone, and a file that
+differs is backed up before it is replaced — `.bak`, then `.bak.1`, `.bak.2`, … as
+those names fill up, so a later upgrade never overwrites an earlier backup. Backups
+are written to a temporary name and moved into place, so an interrupted copy cannot
+leave a truncated file that looks complete. Files that upstream no longer ships are
+left where they are: the installer keeps no manifest, so it cannot tell an outdated
+integration file from a handler you added yourself.
+`.\uninstall.cmd` reverses the install and keeps your journal.
 
 ### Checking another machine
 
