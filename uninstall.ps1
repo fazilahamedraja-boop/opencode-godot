@@ -70,7 +70,8 @@ foreach ($s in @(
         'godot-journal.ps1',
         'godot-mcp-service.cmd',
         'godot-mcp-service.vbs',
-        'godot-mcp-probe.mjs'
+        'godot-mcp-probe.mjs',
+        '.install-source.json'
     )) {
     Remove-Target -Path (Join-Path $ConfigRoot "scripts\$s") -Label "scripts\$s"
 }

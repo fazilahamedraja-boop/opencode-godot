@@ -55,6 +55,28 @@ function Find-Tool {
     return $null
 }
 
+function Get-Sha256 {
+    # Deliberately NOT Get-FileHash: a PowerShell 7 session hands its PSModulePath
+    # to a Windows PowerShell 5.1 child, 5.1 then resolves
+    # Microsoft.PowerShell.Utility from PS7's directory, that Core assembly does
+    # not load, and Get-FileHash disappears from the session. The .NET hash API is
+    # present on every host, imports nothing, and returns the same uppercase hex.
+    param([string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($b in $bytes) { $null = $sb.Append($b.ToString('X2')) }
+            return $sb.ToString()
+        }
+        finally { $sha.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 # ---------------------------------------------------------------- environment
 $os = Get-CimInstance Win32_OperatingSystem
 Row 'windows' ("{0} (build {1})" -f $os.Caption, $os.BuildNumber)
@@ -135,6 +157,72 @@ if (Test-Path -LiteralPath $cfg) {
 }
 else {
     Row 'opencode.json' "no file at $cfg (a fresh opencode install has none)" $false
+}
+
+# ---------------------------------------------------------------- install drift
+# install.ps1 leaves scripts\.install-source.json: the checkout it installed
+# from and a SHA-256 per installed file. Two different mismatches matter, and
+# neither is a broken machine, so both are reported as information only:
+#   * a recorded file whose hash changed here -> the local copy was edited
+#     (a user's deliberate change, or something else writing to the config)
+#   * a recorded file whose hash changed in the checkout -> the checkout has
+#     moved on since this install, i.e. a fix that was never installed
+# Reading only the versions cannot see either: same file, different content.
+$recordPath = Join-Path $configRoot 'scripts\.install-source.json'
+if (Test-Path -LiteralPath $recordPath) {
+    try {
+        $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $sourceRepo = [string]$record.repo
+
+        function Get-RecordedFiles {
+            param($Record)
+            # Empty (or unreadable) "files" must yield nothing, not throw.
+            if (-not $Record -or -not $Record.files) { return @() }
+            $Record.files.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Rel = $_.Name; Sha = [string]$_.Value } }
+        }
+
+        $recorded = @(Get-RecordedFiles -Record $record)
+        $missingHere = 0
+        $editedHere = 0
+        foreach ($item in $recorded) {
+            $file = Join-Path $configRoot ($item.Rel -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $file)) { $missingHere++; continue }
+            if ((Get-Sha256 -Path $file) -ne $item.Sha) { $editedHere++ }
+        }
+
+        $repoMoved = 0
+        $repoPresent = $false
+        if ($sourceRepo) { $repoPresent = Test-Path -LiteralPath $sourceRepo }
+        if ($repoPresent) {
+            foreach ($item in $recorded) {
+                $src = Join-Path $sourceRepo ($item.Rel -replace '/', '\')
+                if (-not (Test-Path -LiteralPath $src)) { $repoMoved++; continue }
+                if ((Get-Sha256 -Path $src) -ne $item.Sha) { $repoMoved++ }
+            }
+        }
+
+        $facts = @()
+        if ($missingHere) { $facts += "$missingHere missing here" }
+        if ($editedHere) { $facts += "$editedHere edited here" }
+        if (-not $facts) { $facts += 'all files as installed' }
+        $source = if ($sourceRepo) { $sourceRepo } else { '(no source path recorded)' }
+        Row 'install' ("{0}  ({1})" -f $source, ($facts -join ', '))
+
+        if ($repoMoved) {
+            Row '   drift' ("{0} file(s) in the checkout differ from this install - run install.cmd to update" -f $repoMoved)
+        }
+        if (-not $repoPresent) {
+            Row '   drift' 'the recorded checkout is not there any more - update checks skipped (re-run install.cmd to re-record)'
+        }
+    }
+    catch {
+        Row 'install' ("$recordPath  UNREADABLE - " + $_.Exception.Message)
+    }
+}
+elseif (Test-Path -LiteralPath (Join-Path $configRoot 'scripts\godot-ensure.ps1')) {
+    # An install that predates the record: nothing is wrong, so this is a hint,
+    # not a failure. Counting it would make every older install NOT READY.
+    Row 'install' 'no install record (run install.cmd again to enable drift checks)'
 }
 
 # ---------------------------------------------------------------- service + bridge

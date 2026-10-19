@@ -101,6 +101,7 @@ scripts\godot-new-project.ps1     addon + [editor_plugins] + runtime probe
 scripts\godot-journal.ps1         -Tail N  /  -Append
 scripts\godot-mcp-service.cmd     the one long-lived HTTP service
 scripts\godot-mcp-probe.mjs       shell-level health check, no AI client
+scripts\.install-source.json      install record: what was installed, for drift checks
 skills\godot-game-by-prompt\      the authoring recipe (auto-loads on "make a game")
 commands\game.md                  /game, a thin wrapper over the skill
 godot-mcp-addon\godot_mcp\        pinned addon copy used for new projects
@@ -143,6 +144,14 @@ the port with no editor attached is `ALMOST`, not a failure: the service is a lo
 HTTP server that can be up on its own, while the bridge is the *addon's* outbound
 connection from the running editor, so a listening port alone says nothing about
 whether Godot is connected. Paste the whole block into an issue if anything is off.
+
+It also prints an `install` row: `install.ps1` leaves `scripts\.install-source.json`
+naming the checkout it installed from and a SHA-256 per installed file, so the
+doctor can tell you that your installed copies were edited here, or that the
+checkout has gained a fix you never installed. Drift is information, not a
+failure — it never changes the verdict or the exit code, because a working box
+with hand-edited scripts is not a broken box. The addon tree is not recorded: it
+is a pinned vendor copy, and a difference there is normal.
 
 ## Use
 
@@ -274,8 +283,15 @@ what lets it run with no Godot installed.
 It ends with an isolation audit: if anything under your real
 `~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
 the run fails (the stubs use private ports, which the audit does not watch). CI
-runs the same 27 tests on two clean Windows images (`windows-2022` and
+runs the same 30 tests on two clean Windows images (`windows-2022` and
 `windows-2025`), under both Windows PowerShell 5.1 and PowerShell 7.
+
+Two of those tests are worth knowing about. One drives the doctor with and
+without an install record, with an edited install, with a checkout that has moved
+on, with a recorded checkout that is gone and with a corrupt record — asserting
+every time that drift is reported and the verdict does not move. The other pins
+hashed-anywhere behaviour: by AST, no runtime script may call `Get-FileHash`
+(gotcha 12).
 
 ## Docs
 

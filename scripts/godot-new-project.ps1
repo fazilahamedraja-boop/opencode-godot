@@ -113,6 +113,29 @@ function Enable-EditorPlugin {
         -Entry ('enabled=PackedStringArray("' + $PluginPath + '")')
 }
 
+function Get-Sha256 {
+    # Deliberately NOT Get-FileHash. A PowerShell 7 session hands its PSModulePath
+    # to the Windows PowerShell 5.1 child this often runs in; 5.1 then resolves
+    # Microsoft.PowerShell.Utility from PS7's directory first, that Core assembly
+    # does not load, and Get-FileHash disappears from the session - which killed
+    # the addon comparison outright. The .NET hash API imports nothing and
+    # returns the same uppercase hex. See install.ps1 for the full note.
+    param([string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($b in $bytes) { $null = $sb.Append($b.ToString('X2')) }
+            return $sb.ToString()
+        }
+        finally { $sha.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 function Save-Backup {
     # Preserve the current contents of a file before it is overwritten, under a
     # name that does not already exist: .bak, then .bak.1, .bak.2, ...
@@ -178,8 +201,8 @@ if ($inSync) {
     foreach ($rel in $addonSourceFiles) {
         $destFile = Join-Path $dest $rel
         if (-not (Test-Path -LiteralPath $destFile)) { $inSync = $false; break }
-        $srcHash = (Get-FileHash -LiteralPath (Join-Path $AddonSource $rel) -Algorithm SHA256).Hash
-        $dstHash = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash
+        $srcHash = Get-Sha256 -Path (Join-Path $AddonSource $rel)
+        $dstHash = Get-Sha256 -Path $destFile
         if ($srcHash -ne $dstHash) { $inSync = $false; break }
     }
 }
@@ -206,8 +229,8 @@ else {
         if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
 
         if (Test-Path -LiteralPath $destFile) {
-            $srcHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash
-            $dstHash = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash
+            $srcHash = Get-Sha256 -Path $sourceFile
+            $dstHash = Get-Sha256 -Path $destFile
             if ($srcHash -eq $dstHash) { continue }
             $null = Save-Backup -Path $destFile
             $backedUp++

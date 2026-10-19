@@ -64,6 +64,30 @@ function Test-Port {
     finally { $client.Close() }
 }
 
+function Get-Sha256 {
+    # Deliberately NOT Get-FileHash. A PowerShell 7 session hands its PSModulePath
+    # to the Windows PowerShell 5.1 child that install.cmd starts; 5.1 then finds
+    # Microsoft.PowerShell.Utility in PS7's directory first, that Core assembly
+    # does not load, and Get-FileHash disappears from the session - so an upgrade
+    # run from a pwsh terminal died with "Get-FileHash is not recognized" partway
+    # through replacing files. The .NET hash API is present on every host and
+    # imports nothing. Uppercase hex, the same shape Get-FileHash returned.
+    param([string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($b in $bytes) { $null = $sb.Append($b.ToString('X2')) }
+            return $sb.ToString()
+        }
+        finally { $sha.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 function Save-Backup {
     # Preserve the current contents of a file before it is overwritten, under a
     # name that does not already exist: .bak, then .bak.1, .bak.2, ...
@@ -102,7 +126,7 @@ function Install-File {
     $dir = Split-Path -Parent $To
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     if (Test-Path -LiteralPath $To) {
-        $same = (Get-FileHash -LiteralPath $From).Hash -eq (Get-FileHash -LiteralPath $To).Hash
+        $same = (Get-Sha256 -Path $From) -eq (Get-Sha256 -Path $To)
         if ($same) { Say ("  = {0}" -f $Label); return }
         $backup = Save-Backup -Path $To
         Copy-Item -LiteralPath $From -Destination $To -Force
@@ -145,7 +169,7 @@ function Install-Tree {
         if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
 
         if (Test-Path -LiteralPath $dest) {
-            if ((Get-FileHash -LiteralPath $source.FullName).Hash -eq (Get-FileHash -LiteralPath $dest).Hash) {
+            if ((Get-Sha256 -Path $source.FullName) -eq (Get-Sha256 -Path $dest)) {
                 $kept++
                 continue
             }
@@ -262,6 +286,21 @@ if (-not (Test-Path -LiteralPath (Join-Path $addonSrc 'plugin.cfg'))) {
 
 Say 'Files' 'Cyan'
 
+# Every file installed OUTSIDE the addon tree is recorded with its SHA-256 in
+# scripts\.install-source.json, so godot-doctor.ps1 can later answer two
+# questions a directory listing cannot: has the installed copy been edited since
+# it was installed, and has this checkout moved on since it was installed? The
+# addon tree is deliberately not listed - it is a pinned vendor copy of ~107
+# files with its own VERSION file, and a difference there is normal (an older
+# upstream, or a handler the user added).
+$installed = [ordered]@{}
+
+function Install-FileTracked {
+    param([string]$From, [string]$To, [string]$Label, [string]$Rel)
+    Install-File -From $From -To $To -Label $Label
+    $script:installed[$Rel] = Get-Sha256 -Path $To
+}
+
 foreach ($s in @(
         'godot-ensure.ps1',
         'godot-doctor.ps1',
@@ -270,18 +309,56 @@ foreach ($s in @(
         'godot-mcp-service.cmd',
         'godot-mcp-probe.mjs'
     )) {
-    Install-File -From (Join-Path $repo "scripts\$s") -To (Join-Path $ConfigRoot "scripts\$s") -Label "scripts\$s"
+    Install-FileTracked -From (Join-Path $repo "scripts\$s") -To (Join-Path $ConfigRoot "scripts\$s") `
+        -Label "scripts\$s" -Rel "scripts/$s"
 }
 
-Install-File -From (Join-Path $repo 'skill\godot-game-by-prompt\SKILL.md') `
+Install-FileTracked -From (Join-Path $repo 'skill\godot-game-by-prompt\SKILL.md') `
     -To (Join-Path $ConfigRoot 'skills\godot-game-by-prompt\SKILL.md') `
-    -Label 'skills\godot-game-by-prompt\SKILL.md'
+    -Label 'skills\godot-game-by-prompt\SKILL.md' `
+    -Rel 'skills/godot-game-by-prompt/SKILL.md'
 
-Install-File -From (Join-Path $repo 'command\game.md') `
+Install-FileTracked -From (Join-Path $repo 'command\game.md') `
     -To (Join-Path $ConfigRoot 'commands\game.md') `
-    -Label 'commands\game.md'
+    -Label 'commands\game.md' `
+    -Rel 'commands/game.md'
 
 Install-Tree -From $addonSrc -To (Join-Path $ConfigRoot 'godot-mcp-addon\godot_mcp') -Label 'godot-mcp-addon\godot_mcp'
+
+# The record is written last, so a failure above leaves the previous record
+# alone instead of describing a half-done install. An install that changed
+# nothing leaves the file (and its installedAt) untouched, so "the second
+# install writes nothing" stays true.
+$recordPath = Join-Path $ConfigRoot 'scripts\.install-source.json'
+$unchanged = $false
+if (Test-Path -LiteralPath $recordPath) {
+    try {
+        $previous = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $old = @{}
+        foreach ($p in $previous.files.PSObject.Properties) { $old[$p.Name] = [string]$p.Value }
+        $unchanged = ($old.Count -eq $installed.Count)
+        if ($unchanged) {
+            foreach ($key in $installed.Keys) {
+                if ($old[$key] -ne $installed[$key]) { $unchanged = $false; break }
+            }
+        }
+    }
+    catch { $unchanged = $false }
+}
+
+if ($unchanged) {
+    Say '  = scripts\.install-source.json'
+}
+else {
+    $newRecord = [ordered]@{
+        repo        = $repo
+        installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        files       = $installed
+    }
+    [System.IO.File]::WriteAllText($recordPath, ($newRecord | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($false)))
+    Say '  + scripts\.install-source.json  (install record for drift checks)' 'Green'
+}
 
 # ---------------------------------------------------------------- autostart
 

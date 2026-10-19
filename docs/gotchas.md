@@ -123,3 +123,33 @@ the wild. Reading only the flat form is what made the doctor report
 shape the file already uses (a new file gets `mcp.servers`). If you move an entry by
 hand, put it in the same object as the other servers — an entry at the wrong depth is
 valid JSON that opencode never reads, and the doctor will say so.
+
+## 12. A PowerShell 7 parent strips `Get-FileHash` from a 5.1 child
+
+`PSModulePath` is inherited. Start `install.cmd` from a PowerShell 7 terminal — or
+from CI, or from any pwsh parent — and the Windows PowerShell 5.1 child it spawns
+resolves `Microsoft.PowerShell.Utility` out of *PS7's* directory first. That
+assembly is a .NET Core one, it does not load under .NET Framework, and the
+cmdlets defined in it — `Get-FileHash` among them — are simply absent from the
+session, while `Get-ChildItem`, `Copy-Item`, `ConvertTo-Json` and the rest keep
+working. So the failure is late and confusing: a *first* install succeeds, then an
+**upgrade** dies partway through replacing files with
+
+```
+Get-FileHash : The term 'Get-FileHash' is not recognized as the name of a cmdlet,
+function, script file, or operable program.
+```
+
+Reproduced end to end on a 5.1.26100.9444 child under pwsh 7.6.7: the same
+`install.cmd <cfg> -NoService -NoAutostart` exits 0, then 1. Your own shell is
+fine either way — this only bites a *different* host's child.
+
+The fix is not to repair the environment but to stop depending on module
+autoloading for hashing: `install.ps1`, `godot-new-project.ps1` and
+`godot-doctor.ps1` each carry a `Get-Sha256` that uses the .NET
+`System.Security.Cryptography.SHA256` API and returns the same uppercase hex
+`Get-FileHash` did, and a regression test asserts by AST that no `Get-FileHash`
+call comes back. If you write automation around this repo, do the same and it
+will not care which host started it. The general shape of the trap is wider than
+hashing: any cmdlet that lives in a *module* can disappear in a child host, so
+anything load-bearing belongs in the script itself, or in .NET.

@@ -793,6 +793,59 @@ Test-Case 'a second install leaves identical files untouched' {
         'the repair rewrote untouched neighbours'
 }
 
+Test-Case 'install records what it installed so drift can be spotted' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    $envMap = Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir)
+    $install = Join-Path $RepoRoot 'install.ps1'
+    $args = @('-ConfigRoot', $cfg, '-NoService', '-NoAutostart')
+
+    $first = Invoke-Og -Path $install -Arguments $args -Environment $envMap
+    Assert-Equal 0 $first.ExitCode ("install exited {0}: {1}" -f $first.ExitCode, (Get-Tail $first.Output))
+
+    $record = Join-Path $cfg 'scripts\.install-source.json'
+    Assert-Exists $record 'the install record was not written'
+
+    $j = ConvertFrom-JsonFile $record
+    Assert-Equal $RepoRoot $j.repo 'the record does not name the checkout it came from'
+    # Read the raw text rather than the parsed value: PowerShell 7's
+    # ConvertFrom-Json turns an ISO-8601 string into a DateTime, so the parsed
+    # shape is host-dependent while the file is not.
+    Assert-Match '"installedAt"\s*:\s*"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"' (Get-Content -LiteralPath $record -Raw) `
+        'installedAt is not a UTC stamp'
+
+    # Every recorded hash has to be the hash of the file that is really installed,
+    # or the doctor's drift check would report noise on a clean install.
+    $names = @($j.files.PSObject.Properties | ForEach-Object { $_.Name })
+    Assert-True ($names.Count -ge 8) ("the record lists too few files: {0}" -f ($names -join ', '))
+    foreach ($prop in $j.files.PSObject.Properties) {
+        $target = Join-Path $cfg ($prop.Name -replace '/', '\')
+        Assert-Exists $target ("the record names a file that is not installed: {0}" -f $prop.Name)
+        Assert-Equal ([string]$prop.Value) (Get-Sha $target) ("the recorded hash is wrong for {0}" -f $prop.Name)
+    }
+    Assert-True ($names -contains 'scripts/godot-doctor.ps1') 'the doctor is not in the record'
+    Assert-True ($names -contains 'commands/game.md') 'the command is not in the record'
+    # The addon tree is a pinned vendor copy: recording it would make a hand-added
+    # handler look like drift on every run.
+    Assert-True (-not ($names -contains 'godot-mcp-addon/godot_mcp/plugin.cfg')) 'the addon tree was recorded'
+
+    # A second, identical install must leave the record alone: installedAt is the
+    # answer to "when was this content put here?".
+    $stamp = (Get-Item -LiteralPath $record).LastWriteTimeUtc
+    $second = Invoke-Og -Path $install -Arguments $args -Environment $envMap
+    Assert-Equal 0 $second.ExitCode ("second install exited {0}: {1}" -f $second.ExitCode, (Get-Tail $second.Output))
+    Assert-Equal $stamp (Get-Item -LiteralPath $record).LastWriteTimeUtc 'the record was rewritten although nothing changed'
+    Assert-Match '(?m)^  = scripts\\\.install-source\.json' $second.Output 'the unchanged record was not reported as unchanged'
+
+    # Uninstall must take it away, or a later install would inherit a stale record.
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'uninstall.ps1') -Arguments @('-ConfigRoot', $cfg)
+    Assert-Equal 0 $r.ExitCode ("uninstall exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Missing $record 'uninstall left the install record behind'
+}
+
 Test-Case 'addon provisioning detects missing and modified files by hash' {
     param($dir)
 
@@ -944,6 +997,7 @@ Test-Case 'uninstall removes only integration-owned files' {
     foreach ($owned in @(
             'scripts\godot-ensure.ps1', 'scripts\godot-doctor.ps1', 'scripts\godot-journal.ps1',
             'scripts\godot-mcp-service.cmd', 'scripts\godot-mcp-probe.mjs',
+            'scripts\.install-source.json',
             'skills\godot-game-by-prompt\SKILL.md', 'commands\game.md',
             'godot-mcp-addon\godot_mcp\plugin.cfg')) {
         Assert-Missing (Join-Path $cfg $owned) "uninstall left an owned file behind: $owned"
@@ -1688,6 +1742,144 @@ Test-Case 'doctor: READY, ALMOST and NOT READY, with service and bridge distinct
         Stop-FakeMcpServer -Job $job
         $bridgeListener.Stop()
     }
+}
+
+# ================================================================== doctor drift
+
+Test-Case 'doctor: an install record is checked, and drift never fails the box' {
+    param($dir)
+
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path (Join-Path $cfg 'scripts') | Out-Null
+    $homeDir = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $homeDir | Out-Null
+
+    $port = 9594
+    $bridgePort = 9586
+    [System.IO.File]::WriteAllText((Join-Path $cfg 'opencode.json'),
+        (@{ mcp = @{ servers = @{ godot = @{ type = 'remote'; url = "http://127.0.0.1:$port/mcp" } } } } | ConvertTo-Json -Depth 6),
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    $bin = Join-Path $dir 'bin'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $bin 'uv.exe'), 'stub - never executed')
+    $godotStub = Join-Path $dir 'Godot_v4.7.2-stable_win64.exe'
+    [System.IO.File]::WriteAllText($godotStub, 'stub - never executed')
+
+    # The checkout the record points at holds real files, so the hash comparison
+    # under test is a real comparison rather than a mock of one.
+    $checkout = Join-Path $dir 'checkout'
+    New-Item -ItemType Directory -Force -Path (Join-Path $checkout 'scripts') | Out-Null
+    $installedFile = Join-Path $cfg 'scripts\godot-ensure.ps1'
+    $checkoutFile = Join-Path $checkout 'scripts\godot-ensure.ps1'
+    [System.IO.File]::WriteAllText($installedFile, "installed copy`n")
+    [System.IO.File]::WriteAllText($checkoutFile, "installed copy`n")
+
+    $record = Join-Path $cfg 'scripts\.install-source.json'
+    $bridgeListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $bridgePort)
+    $bridgeListener.Start()
+    $job = Start-FakeMcpServer -Port $port -BridgeConnected $false -MaxRequests 24
+    Assert-True (Wait-PortState -Port $port -Listening $true) 'the stub service never listened'
+
+    $doctor = Join-Path $RepoRoot 'scripts\godot-doctor.ps1'
+    $envMap = @{
+        USERPROFILE           = $homeDir
+        OPENCODE_GODOT_CONFIG = $cfg
+        GODOT_MCP_HTTP_PORT   = "$port"
+        GODOT_MCP_BRIDGE_PORT = "$bridgePort"
+        GODOT_MCP_SERVER_EXE  = (New-StubServer -Dir $dir)
+        GODOT_BIN             = $godotStub
+        PATH                  = "$bin;$(Get-MinimalPath)"
+    }
+
+    try {
+        # 1. No record yet (any install made before this feature): a hint, not a
+        #    failure. Counting it would mark every older install NOT READY.
+        Assert-Missing $record 'the test started with a stale record'
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("the doctor exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match '(?m)^  ALMOST' $r.Output 'an install without a record is not ALMOST'
+        Assert-Match 'no install record' $r.Output 'the missing record was not mentioned'
+
+        # 2. In sync: reported, with no drift hint.
+        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'; files = @{ 'scripts/godot-ensure.ps1' = (Get-Sha $installedFile) } } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("the doctor exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match ("install\s+" + [regex]::Escape($checkout)) $r.Output 'the recorded checkout was not reported'
+        Assert-Match 'all files as installed' $r.Output 'an in-sync install was not recognised'
+        Assert-NotMatch '(?m)^\s+drift' $r.Output 'drift was reported on an in-sync install'
+        Assert-Match '(?m)^  ALMOST' $r.Output 'an in-sync install is not ALMOST'
+
+        # 3. The installed file was edited here: reported, and still not a failure.
+        [System.IO.File]::AppendAllText($installedFile, "# local edit`n")
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("an edited install must not fail the box, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match '1 edited here' $r.Output 'a locally edited file was not reported'
+        Assert-Match '(?m)^  ALMOST' $r.Output 'a locally edited install is not ALMOST'
+
+        # 4. The checkout has moved on as well: the update hint appears.
+        [System.IO.File]::AppendAllText($checkoutFile, "# newer in the checkout`n")
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("a moved-on checkout must not fail the box, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match 'run install\.cmd to update' $r.Output 'the update hint was not printed'
+        Assert-Match '1 edited here' $r.Output 'the local edit stopped being reported'
+        Assert-Match '(?m)^  ALMOST' $r.Output 'a moved-on checkout is not ALMOST'
+
+        # 5. A recorded checkout that is gone: explained, not a crash (the repo a
+        #    user installed from can be moved or deleted without breaking the box).
+        @{ repo = (Join-Path $dir 'gone'); installedAt = '2026-01-01T00:00:00Z'; files = @{ 'scripts/godot-ensure.ps1' = (Get-Sha $installedFile) } } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("a missing checkout must not fail the box, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match 'not there any more' $r.Output 'a missing checkout was not explained'
+        Assert-NotMatch 'At line:|CategoryInfo' $r.Output 'the doctor crashed on a missing checkout'
+
+        # 6. A corrupt record: reported, still not a crash, still not a failure.
+        [System.IO.File]::WriteAllText($record, '{ this is not json')
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("a corrupt record must not fail the box, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match 'UNREADABLE' $r.Output 'a corrupt record was not reported'
+        Assert-NotMatch 'At line:|CategoryInfo' $r.Output 'the doctor crashed on a corrupt record'
+    }
+    finally {
+        Stop-FakeMcpServer -Job $job
+        $bridgeListener.Stop()
+    }
+}
+
+# ================================================================== hashing
+
+Test-Case 'the scripts hash files without relying on module autoloading' {
+    param($dir)
+
+    # Get-FileHash is only as reliable as the child session's PSModulePath. When a
+    # PowerShell 7 parent hands its PSModulePath to the Windows PowerShell 5.1
+    # child that install.cmd starts, 5.1 resolves Microsoft.PowerShell.Utility
+    # from PS7's directory first, that Core assembly fails to load, and the cmdlet
+    # is gone from the session - which killed an install.cmd upgrade from a pwsh
+    # terminal with "Get-FileHash is not recognized" after files had been copied.
+    # Hashing therefore goes through each script's own .NET helper.
+    foreach ($file in @('install.ps1', 'scripts\godot-new-project.ps1', 'scripts\godot-doctor.ps1')) {
+        $path = Join-Path $RepoRoot $file
+        # AST, not a text search: the notes explaining this bug name the cmdlet,
+        # and a comment must not be able to satisfy - or trip - the check.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Get-FileHash'
+                }, $true))
+        Assert-Equal 0 $calls.Count ("{0} still hashes through module autoloading" -f $file)
+        Assert-Match 'function Get-Sha256' (Get-Content -LiteralPath $path -Raw) ("{0} has no self-contained hash helper" -f $file)
+    }
+
+    # The helper has to return what Get-FileHash returned (uppercase hex), or a
+    # hash recorded by one host would read as drift under another.
+    Import-ScriptFunction -Path (Join-Path $RepoRoot 'scripts\godot-doctor.ps1') -Name @('Get-Sha256')
+    $sample = Join-Path $dir 'sample.txt'
+    [System.IO.File]::WriteAllText($sample, "hello world`n")
+    Assert-Equal (Get-Sha $sample) (Get-Sha256 -Path $sample) 'the helper disagrees with Get-FileHash'
 }
 
 # ================================================================== isolation audit
