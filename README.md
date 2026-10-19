@@ -139,6 +139,13 @@ never the Project Manager, or you get an empty project with no addon:
 For an existing project, `-Restart` relaunches the editor after the addon is
 copied in (Godot reads `[editor_plugins]` only at startup).
 
+Provisioning an already-prepared project changes nothing. On an upgrade it copies
+only the addon files that actually differ, and backs up a file it is about to
+replace the same way the installer does (`.bak`, `.bak.1`, …) — a handler you edited
+by hand is restored to the pinned copy only after its previous contents are saved.
+Files upstream no longer ships are left alone, because without a manifest there is
+no way to tell them from files you added.
+
 It prints `BRIDGE CONNECTED` and exits `0` when the chain is live. Exit codes:
 
 | Code | Meaning |

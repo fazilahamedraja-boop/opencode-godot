@@ -10,6 +10,13 @@
 
     Idempotent: running it again on an already-prepared project changes nothing.
 
+    Upgrading: an addon file in the project that differs from the canonical copy
+    is the user's, and is backed up as <name>.bak (then .bak.1, ...) before it is
+    replaced, so a hand-edited handler is never lost. Only files that differ are
+    rewritten -- a running editor rescans the addon otherwise. Files that no
+    longer exist upstream are left alone: without a manifest this script cannot
+    tell a user's file from an obsolete one.
+
 .PARAMETER ProjectPath
     Directory containing project.godot.
 
@@ -106,6 +113,37 @@ function Enable-EditorPlugin {
         -Entry ('enabled=PackedStringArray("' + $PluginPath + '")')
 }
 
+function Save-Backup {
+    # Preserve the current contents of a file before it is overwritten, under a
+    # name that does not already exist: .bak, then .bak.1, .bak.2, ...
+    #
+    # Same contract as install.ps1's helper, duplicated on purpose: these scripts
+    # ship standalone, so there is no module to share it from.
+    #   * Never reuse a name, or the second upgrade silently replaces the first
+    #     backup - and after a file has been edited twice the first backup is the
+    #     only copy of the original left.
+    #   * Copy to a ".partial" name and only then move it into place, so an
+    #     interrupted copy cannot leave a truncated file that looks complete.
+    param([string]$Path)
+
+    $candidate = "$Path.bak"
+    $n = 0
+    while (Test-Path -LiteralPath $candidate) {
+        $n++
+        $candidate = "$Path.bak.$n"
+    }
+    $temp = "$candidate.partial"
+    try {
+        Copy-Item -LiteralPath $Path -Destination $temp -Force
+        Move-Item -LiteralPath $temp -Destination $candidate -Force
+    }
+    catch {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    return $candidate
+}
+
 # ---------------------------------------------------------------- main
 
 $projectPath = (Resolve-Path -LiteralPath $ProjectPath).Path
@@ -151,9 +189,41 @@ if ($inSync) {
 }
 else {
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Copy-Item -Path (Join-Path $AddonSource '*') -Destination $dest -Recurse -Force
-    $fileCount = (Get-ChildItem -LiteralPath $dest -Recurse -File).Count
+
+    # Per file, not a whole-tree Copy-Item -Force. Two reasons:
+    #   * A file that differs is the user's edit or an older upstream, and it is
+    #     backed up before it is replaced. The bulk copy destroyed it instead.
+    #   * Copy-Item -Force rewrites every file, so one damaged handler used to
+    #     rewrite all of them under a running editor and trigger a full rescan.
+    # Stale files (present here, gone upstream) are left alone, as in install.ps1:
+    # without a manifest a user's own handler is indistinguishable from an obsolete
+    # integration file.
+    $backedUp = 0
+    foreach ($rel in $addonSourceFiles) {
+        $sourceFile = Join-Path $AddonSource $rel
+        $destFile = Join-Path $dest $rel
+        $destDir = Split-Path -Parent $destFile
+        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+
+        if (Test-Path -LiteralPath $destFile) {
+            $srcHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash
+            $dstHash = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash
+            if ($srcHash -eq $dstHash) { continue }
+            $null = Save-Backup -Path $destFile
+            $backedUp++
+        }
+        Copy-Item -LiteralPath $sourceFile -Destination $destFile -Force
+    }
+
+    # Count only real addon files, so backups are not reported as provisioned code.
+    $fileCount = @(
+        Get-ChildItem -LiteralPath $dest -Recurse -File |
+            Where-Object { $_.Name -notmatch '\.bak(\.\d+)?$' -and $_.Name -notmatch '\.partial$' }
+    ).Count
     Write-Host "addon   : copied $fileCount files -> addons\godot_mcp"
+    if ($backedUp -gt 0) {
+        Write-Host "addon   : $backedUp replaced file(s) backed up as .bak"
+    }
 }
 
 # 2. project.godot
