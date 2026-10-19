@@ -229,6 +229,20 @@ message when Godot is absent, and an MCP entry left pointing at a stale port.
 different build, a real reboot firing the logon autostart, and macOS/Linux.
 `godot-doctor.ps1` exists to make that verification one command.
 
+## Tests
+
+The installer, the `opencode.json` handling, addon provisioning and the
+uninstaller have a regression suite that runs the real scripts in throwaway
+directories — no Godot, no server start, no ports bound:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
+```
+
+It ends with an isolation audit: if anything under your real
+`~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
+the run fails. CI runs the same suite on `windows-latest`.
+
 ## Docs
 
 - [docs/architecture.md](docs/architecture.md) — the four links, and why each
