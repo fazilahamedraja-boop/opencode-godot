@@ -7,10 +7,12 @@
 #
 #     git apply addon/patches/0001-values-equal-float-components-with-epsilon.patch
 #
-# Cut from this vendored file, at this content (the test suite checks both,
-# so bumping the vendored addon forces this patch to be refreshed):
+# Cut from this vendored file, at this content:
 # target: addon/godot_mcp/type_coerce.gd
 # sha256: a0fb59a8fd68df0fc0ec884f8a7b4917ebe1a8083405a00166b37e20cb1c7e57
+#   (of the LF-normalised content, so the record does not depend on whether
+#    the checkout used CRLF; the test suite checks it, and bumping the
+#    vendored addon therefore forces this patch to be refreshed)
 #
 # Background: docs/gotchas.md, gotcha 1. Verified on Godot 4.7.2 - see the
 # session notes in the PR that offers this upstream.

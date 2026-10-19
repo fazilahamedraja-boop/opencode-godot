@@ -78,6 +78,27 @@ function Get-Sha {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
+function Get-ShaLf {
+    # SHA-256 of the content with CRLF normalised to LF.
+    #
+    # The vendored addon is LF in the index, but GitHub's Windows runners check
+    # out with core.autocrlf=true, which materialises *.gd with CRLF - so a raw
+    # byte hash of the working file is a property of the *checkout*, and a guard
+    # built on it passes locally and fails in CI (which is exactly what happened
+    # on 9043890). Normalising keeps the guard about content, which is what a
+    # patch is cut from.
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $out = New-Object 'System.Collections.Generic.List[byte]'
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 0x0D -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 0x0A) { continue }
+        $out.Add($bytes[$i])
+    }
+    $alg = [System.Security.Cryptography.SHA256]::Create()
+    try { return (($alg.ComputeHash($out.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant() }
+    finally { $alg.Dispose() }
+}
+
 function Get-Tail {
     param([string]$Text, [int]$Lines = 15)
     if (-not $Text) { return '<no output>' }
@@ -1908,7 +1929,8 @@ Test-Case 'the addon patch is still cut from the vendored addon' {
         Assert-Exists $file ('{0} names a file that is not in this repo' -f $patch.Name)
         Assert-Match ('(?m)^diff --git a/{0} b/{0}$' -f [regex]::Escape($rel)) $text `
             ('{0}: carries no diff for its own target' -f $patch.Name)
-        Assert-Equal ($sha.Groups[1].Value.ToUpperInvariant()) (Get-Sha $file) `
+        # Content, not the checkout's line-ending policy - see Get-ShaLf.
+        Assert-Equal ($sha.Groups[1].Value.ToUpperInvariant()) (Get-ShaLf $file) `
             ('{0}: {1} has changed since the patch was cut - refresh the patch and its sha256' -f $patch.Name, $rel)
     }
 
