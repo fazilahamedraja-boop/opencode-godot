@@ -85,6 +85,17 @@ function Write-Step { param([string]$Message)
     Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message)
 }
 
+# A beginner should never see a PowerShell stack trace. Print the reason, the fix,
+# and a documented exit code instead.
+function Fail {
+    param([string]$Message, [string[]]$Hints = @(), [int]$Code = 1)
+    Write-Host ''
+    Write-Step "ERROR: $Message"
+    foreach ($h in $Hints) { Write-Host "         $h" }
+    Write-Host ''
+    exit $Code
+}
+
 function Test-PortListening {
     param([int]$Port)
     $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
@@ -119,8 +130,14 @@ function Get-GodotEditors {
 }
 
 function Resolve-GodotExe {
-    if ($GodotExe) { return $GodotExe }
-    if ($env:GODOT_BIN) { return $env:GODOT_BIN }
+    if ($GodotExe) {
+        if (-not (Test-Path -LiteralPath $GodotExe)) { Fail "Godot exe not found at -GodotExe '$GodotExe'." @() 5 }
+        return $GodotExe
+    }
+    if ($env:GODOT_BIN) {
+        if (-not (Test-Path -LiteralPath $env:GODOT_BIN)) { Fail "GODOT_BIN points at '$env:GODOT_BIN', which does not exist." @() 5 }
+        return $env:GODOT_BIN
+    }
 
     # 1. on PATH (the console build prints CLI output, so prefer it)
     foreach ($name in @('godot_console', 'godot')) {
@@ -128,20 +145,29 @@ function Resolve-GodotExe {
         if ($cmd) { return $cmd.Source }
     }
 
-    # 2. the usual manual-unzip places, newest build first
+    # 2. where a beginner actually leaves it: the ZIP unpacked in Downloads or on
+    #    the Desktop, then the usual manual-install places. Shallow-but-wide beats
+    #    a deep search of the whole profile.
     $dirs = @(
+        (Join-Path $env:USERPROFILE 'Downloads'),
+        (Join-Path $env:USERPROFILE 'Desktop'),
         (Join-Path $env:USERPROFILE 'godot'),
         (Join-Path $env:LOCALAPPDATA 'Programs'),
-        (Join-Path ${env:ProgramFiles} 'Godot')
+        (Join-Path ${env:ProgramFiles} 'Godot'),
+        (Join-Path ${env:ProgramFiles} 'Godot Engine')
     )
     foreach ($dir in $dirs) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
-        $hit = Get-ChildItem $dir -Filter 'Godot_v*-stable_win64*.exe' -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+        $hit = Get-ChildItem $dir -Filter 'Godot_v*-stable_win64*.exe' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending | Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
 
-    throw "Godot editor exe not found. Put 'godot' on PATH, set GODOT_BIN, or pass -GodotExe <path>."
+    Fail "Godot is not installed, or it is somewhere this script cannot guess." @(
+        'download: https://godotengine.org/download/windows/  (unzip anywhere)',
+        'then either:  -GodotExe "C:\path\to\Godot_v4.x-stable_win64_console.exe"',
+        'or:          set GODOT_BIN to that path, or put it on PATH'
+    ) 5
 }
 
 function Start-Editor {
@@ -153,7 +179,7 @@ function Start-Editor {
 # ------------------------------------------------------------------ 1. project
 
 if ($Create) {
-    if (-not $ProjectPath) { throw "-Create needs -ProjectPath." }
+    if (-not $ProjectPath) { Fail "-Create needs -ProjectPath <dir>." @() 1 }
     if (Test-Path -LiteralPath (Join-Path $ProjectPath 'project.godot')) {
         Write-Step "project already exists, not recreating: $ProjectPath"
     }
@@ -195,9 +221,9 @@ if (-not $ProjectPath) {
     }
 }
 if (-not $ProjectPath) {
-    throw "No project to prepare. Pass -ProjectPath."
+    Fail "No project to prepare. Pass -ProjectPath <dir>." @("or run -Create -ProjectPath <dir> for a new project") 1
 }
-if (-not (Test-Path -LiteralPath $ProjectPath)) { throw "Project path does not exist: $ProjectPath" }
+if (-not (Test-Path -LiteralPath $ProjectPath)) { Fail "Project path does not exist: $ProjectPath" @() 1 }
 $proj = (Resolve-Path -LiteralPath $ProjectPath).Path
 
 # -------------------------------------------------------------- 2. http service
@@ -208,14 +234,14 @@ if (Test-PortListening -Port $servicePort) {
 else {
     Write-Step "service: not listening - starting godot-mcp-service.cmd"
     $svc = Join-Path $PSScriptRoot 'godot-mcp-service.cmd'
-    if (-not (Test-Path -LiteralPath $svc)) { throw "Missing $svc" }
+    if (-not (Test-Path -LiteralPath $svc)) { Fail "Missing the launcher: $svc" @("re-run the installer so scripts\ is complete") 5 }
 
     # Fail fast with an actionable message instead of waiting out the timeout.
     $serverFound = $env:GODOT_MCP_SERVER_EXE -or
         (Get-Command 'godot-editor-mcp' -ErrorAction SilentlyContinue) -or
         (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe'))
     if (-not $serverFound) {
-        throw "godot-editor-mcp is not installed. Install it, then re-run:`n    uv tool install godot-editor-mcp`n(or set GODOT_MCP_SERVER_EXE to its full path.)"
+        Fail "godot-editor-mcp is not installed." @("install it:   uv tool install godot-editor-mcp", "no uv yet?    winget install --id=astral-sh.uv -e", "or point GODOT_MCP_SERVER_EXE at the exe") 5
     }
 
     Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$svc`"" -WindowStyle Hidden | Out-Null
@@ -223,7 +249,7 @@ else {
     while ((Get-Date) -lt $deadline -and -not (Test-PortListening -Port $servicePort)) {
         Start-Sleep -Milliseconds 500
     }
-    if (-not (Test-PortListening -Port $servicePort)) { throw "Service did not come up on $servicePort." }
+    if (-not (Test-PortListening -Port $servicePort)) { Fail "The service did not come up on port $servicePort." @("log: $env:LOCALAPPDATA\godot-mcp\service-starts.log", "the usual cause is a missing godot-editor-mcp or a port already in use") 5 }
     Write-Step "service: up"
 }
 

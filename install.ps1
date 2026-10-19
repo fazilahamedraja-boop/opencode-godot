@@ -42,7 +42,8 @@ param(
     [switch]$PatchOpencode,
     [switch]$NoAutostart,
     [switch]$NoService,
-    [switch]$Verify
+    [switch]$Verify,
+    [switch]$InstallServer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,12 +110,59 @@ Say ("  source : {0}" -f $repo)
 Say ("  target : {0}" -f $ConfigRoot)
 Say ''
 
-$serverExe = $env:GODOT_MCP_SERVER_EXE
-if (-not $serverExe) {
+function Find-Uv {
+    $cmd = Get-Command 'uv' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    $fallback = Join-Path $env:USERPROFILE '.local\bin\uv.exe'
+    if (Test-Path -LiteralPath $fallback) { return $fallback }
+    return $null
+}
+
+function Find-Server {
+    if ($env:GODOT_MCP_SERVER_EXE -and (Test-Path -LiteralPath $env:GODOT_MCP_SERVER_EXE)) { return $env:GODOT_MCP_SERVER_EXE }
     $cmd = Get-Command 'godot-editor-mcp' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) { $serverExe = $cmd.Source }
-    elseif (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe')) {
-        $serverExe = Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe'
+    if ($cmd) { return $cmd.Source }
+    $fallback = Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe'
+    if (Test-Path -LiteralPath $fallback) { return $fallback }
+    return $null
+}
+
+$uv = Find-Uv
+$serverExe = Find-Server
+
+if (-not $serverExe -and $InstallServer) {
+    if (-not $uv) {
+        Say ''
+        Say '  ! -InstallServer needs uv, and uv is not installed.' 'Red'
+        Say '    install uv first, then re-run this command:' 'Gray'
+        Say '      winget install --id=astral-sh.uv -e' 'DarkGray'
+        Say '      (or: powershell -c "irm https://astral.sh/uv/install.ps1 | iex")' 'DarkGray'
+        exit 1
+    }
+    Say ''
+    Say 'Server' 'Cyan'
+    Say '  installing godot-editor-mcp with uv ...'
+    # uv writes its progress to stderr. Under $ErrorActionPreference='Stop',
+    # PowerShell 5.1 turns a native command's stderr into a terminating
+    # NativeCommandError - so relax it for exactly this call and read the code.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $uv tool install godot-editor-mcp 2>&1 | ForEach-Object { "    $_" }
+    $installCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+
+    $serverExe = Find-Server
+    if ($installCode -ne 0) {
+        Say ("  ! uv tool install failed (exit {0}) - see the output above" -f $installCode) 'Red'
+        Say '    if a previous attempt was interrupted, repair it with:' 'Gray'
+        Say '        uv tool uninstall godot-editor-mcp' 'DarkGray'
+        Say '    then re-run this installer.' 'Gray'
+        exit 1
+    }
+    if ($serverExe) { Say ("  + {0}" -f $serverExe) 'Green' }
+    else {
+        Say '  ! uv ran but godot-editor-mcp is still not found - check the output above' 'Red'
+        exit 1
     }
 }
 
@@ -122,9 +170,22 @@ if ($serverExe) {
     Say ("  mcp server : {0}" -f $serverExe) 'Green'
 }
 else {
-    Say '  mcp server : NOT FOUND' 'Yellow'
-    Say '               install it first:  uv tool install godot-editor-mcp' 'Yellow'
-    Say '               (the workflow can be installed now and started later)' 'DarkGray'
+    Say '  mcp server : NOT INSTALLED' 'Red'
+    if ($uv) {
+        Say '               run this, then re-run the installer:' 'Gray'
+        Say '                   uv tool install godot-editor-mcp' 'DarkGray'
+        Say '               or use -InstallServer to do it here.' 'DarkGray'
+    }
+    else {
+        # The usual first-run wall: no Python toolchain at all. Give the exact
+        # commands in order, not the one command that cannot work yet.
+        Say '               you need uv (a small Python tool runner) first:' 'Gray'
+        Say '                   1) winget install --id=astral-sh.uv -e' 'DarkGray'
+        Say '                   2) uv tool install godot-editor-mcp' 'DarkGray'
+        Say '               or: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"' 'DarkGray'
+        Say '               then re-run this installer (or use -InstallServer after step 1).' 'Gray'
+    }
+    Say '               the workflow files are installed anyway; the service needs the server.' 'DarkGray'
 }
 
 $addonSrc = Join-Path $repo 'addon\godot_mcp'
@@ -138,6 +199,7 @@ Say 'Files' 'Cyan'
 
 foreach ($s in @(
         'godot-ensure.ps1',
+        'godot-doctor.ps1',
         'godot-new-project.ps1',
         'godot-journal.ps1',
         'godot-mcp-service.cmd',
@@ -249,8 +311,44 @@ if (-not (Test-Path -LiteralPath $cfg)) {
 else {
     $raw = Get-Content -LiteralPath $cfg -Raw
     if ($raw -match '"godot"\s*:') {
-        Say ''
-        Say 'opencode.json : already has a "godot" MCP server' 'Green'
+        # An entry that exists is not necessarily an entry that works: if the
+        # port changed, opencode connects to nothing and the tools silently
+        # never appear. Converge on the current port instead of no-oping.
+        $target = "http://127.0.0.1:$svcPort/mcp"
+        $current = $null
+        try { $current = (ConvertFrom-Json $raw).mcp.godot.url } catch { }
+        if ($current -eq $target) {
+            Say ''
+            Say 'opencode.json : already has the "godot" MCP server' 'Green'
+        }
+        elseif (-not $current) {
+            Say ''
+            Say 'opencode.json : has a "godot" entry this script cannot read - check it by hand' 'Yellow'
+        }
+        elseif (-not $PatchOpencode) {
+            Say ''
+            Say ("opencode.json : `"godot`" points at {0}, but the service is on {1}" -f $current, $target) 'Yellow'
+            Say '                re-run with -PatchOpencode to update it' 'Gray'
+        }
+        elseif (([regex]::Matches($raw, [regex]::Escape($current))).Count -ne 1) {
+            Say ''
+            Say 'opencode.json : the old URL appears more than once - edit the "godot" url by hand' 'Yellow'
+        }
+        else {
+            $updated = $raw.Replace($current, $target)
+            $valid = $true
+            try { $null = $updated | ConvertFrom-Json } catch { $valid = $false }
+            if (-not $valid) {
+                Say ''
+                Say 'opencode.json : refusing to write - the result would not be valid JSON' 'Red'
+            }
+            else {
+                Copy-Item -LiteralPath $cfg -Destination "$cfg.bak-opencode-godot" -Force
+                [System.IO.File]::WriteAllText($cfg, $updated, (New-Object System.Text.UTF8Encoding($false)))
+                Say ''
+                Say ("opencode.json : updated `"godot`" -> {0}" -f $target) 'Green'
+            }
+        }
     }
     elseif ($PatchOpencode) {
         $marker = '"mcp"\s*:\s*\{'
@@ -313,13 +411,40 @@ if ($Verify) {
         Say '  ! node not found - cannot run the probe' 'Yellow'
     }
     else {
+        # Same stderr hazard as -InstallServer: a warning from node must not
+        # abort the installer.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         & node $probe --tools
-        if ($LASTEXITCODE -ne 0) { Say '  ! service unreachable' 'Red' }
+        $probeCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($probeCode -ne 0) { Say '  ! service unreachable' 'Red' }
     }
 }
 
 Say ''
+if (-not $serverExe) {
+    # A cheerful "Done" here is how a beginner ends up with a workflow that cannot
+    # start. Say what is actually missing and make the exit code honest.
+    Say 'NOT READY - the godot-editor-mcp server is missing (see above).' 'Red'
+    Say '  the files are installed, so you only need to install the server:' 'Gray'
+    if ($uv) { Say '      uv tool install godot-editor-mcp' 'DarkGray' }
+    else {
+        Say '      winget install --id=astral-sh.uv -e' 'DarkGray'
+        Say '      uv tool install godot-editor-mcp' 'DarkGray'
+    }
+    Say '  then re-run this installer.' 'Gray'
+    Say ''
+    exit 1
+}
+
 Say 'Done.' 'Cyan'
 Say '  next: open your Godot project, then ask opencode for a game.' 'Gray'
-Say '        first time in a project:  scripts\godot-ensure.ps1 -ProjectPath <dir> -Restart' 'Gray'
+if (-not $NoService) {
+    Say '  if opencode is already running, reload it so it picks up the MCP server:  opencode reload' 'Gray'
+}
+Say '        first time in a project (this form works even when .ps1 files are blocked):' 'Gray'
+Say '            powershell -NoProfile -ExecutionPolicy Bypass -File scripts\godot-ensure.ps1 -ProjectPath <dir> -Restart' 'DarkGray'
+Say '        not sure it works? one-block report:' 'Gray'
+Say '            powershell -NoProfile -ExecutionPolicy Bypass -File scripts\godot-doctor.ps1' 'DarkGray'
 Say ''

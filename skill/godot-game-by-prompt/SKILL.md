@@ -20,8 +20,13 @@ This skill is the authoritative recipe. `/game` is a thin wrapper that invokes i
 # 0. readiness - ALWAYS first, and it is what makes a cold session work
 #    (scripts are installed here by install.ps1; use the full path from a bare shell)
 $OG = "$env:USERPROFILE\.config\opencode\scripts"
-& "$OG\godot-journal.ps1" -Tail 5                # what exists, what was left next
-& "$OG\godot-ensure.ps1"                         # remembered project; + addon, plugin,
+$OG = "$env:USERPROFILE\.config\opencode\scripts"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$OG\godot-journal.ps1" -Tail 5
+                                                 # what exists, what was left next
+#    -ExecutionPolicy Bypass: a fresh Windows profile blocks .ps1 files, and the
+#    failure ("running scripts is disabled") looks like a broken skill otherwise.
+powershell -NoProfile -ExecutionPolicy Bypass -File "$OG\godot-ensure.ps1"
+                                                 # remembered project; + addon, plugin,
                                                  # editor, and WAITS for the bridge
 
 # 1-3. the build
@@ -30,8 +35,9 @@ godot_enable_toolset("<one comma list>")       # ONE call exposes everything
 godot_composite_run_commands([...])            # ONE call builds the whole game
 
 # 4. hand off
-& "$OG\godot-journal.ps1" -Append -Game ... -Scene ...   # continuity for the next session
-                                                         # then report; F5 is the user's step
+powershell -NoProfile -ExecutionPolicy Bypass -File "$OG\godot-journal.ps1" `
+    -Append -Game ... -Scene ...     # continuity for the next session
+                                     # then report; F5 is the user's step
 ```
 
 Do **not** discover tool names, do **not** enable toolsets one at a time, and do
@@ -74,8 +80,11 @@ ESTABLISHED connection owned by that Godot process proves it.
 - `-Restart` kills and relaunches an editor whose project just gained the addon.
   **Only with the user's consent** — it loses unsaved work. Without it the script
   exits 2 and says a reload is needed.
-- Exit codes: `0` ready, `2` needs a manual reload, `3` bridge never connected,
-  `4` another project's editor owns the bridge (close it, or pass `-Restart`).
+- Exit codes: `0` ready, `1` bad input, `2` needs a manual reload, `3` bridge never
+  connected, `4` another project's editor owns the bridge (close it, or pass
+  `-Restart`), `5` a prerequisite is missing (the `godot-editor-mcp` server, or
+  Godot itself). On `5` the message names the exact command to run — relay it
+  instead of guessing, and do not retry the same call.
 
 **Default to a new scene in the project that is already open.** A new *project* is
 only for when the user asks for one: the bridge is single-connection, so a second
@@ -233,7 +242,8 @@ Your job ends at a saved scene. Instead of testing:
 Then record it, then report it:
 
 ```powershell
-& "$env:USERPROFILE\.config\opencode\scripts\godot-journal.ps1" -Append -Game "<name>" `
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.config\opencode\scripts\godot-journal.ps1" `
+    -Append -Game "<name>" `
     -Project "<dir>" -Scene "res://<scene>.tscn" -Controls "<input>" -Status "built, not run" -Next "<next step>"
 ```
 
@@ -341,6 +351,9 @@ The addon is **per project** — a new project without this has no bridge.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `running scripts is disabled on this system` | default Windows execution policy, or a downloaded file carrying Mark-of-the-Web | call it as `powershell -NoProfile -ExecutionPolicy Bypass -File <script>`; the repo's `install.cmd` / `uninstall.cmd` already do this |
+| exit code 5, "godot-editor-mcp is not installed" | the Python server was never installed | `uv tool install godot-editor-mcp` (no uv yet: `winget install --id=astral-sh.uv -e`) |
+| exit code 5, "Godot is not installed, or it is somewhere this script cannot guess" | the ZIP is unpacked outside PATH/Downloads/Desktop | pass `-GodotExe "<path>\Godot_v4.x-stable_win64_console.exe"`, set `GODOT_BIN`, or put it on PATH |
 | godot tools missing entirely | the HTTP service is down | run `godot-ensure.ps1` (starts it), or `opencode reload` (~6 s) |
 | `BRIDGE_DISCONNECTED` | no editor, addon missing, plugin off, or a *different* project open | run `godot-ensure.ps1`; pass `-Restart` if it just gained the addon |
 | new project has "no plugin" | addon never copied / `[editor_plugins]` never written | `godot-ensure.ps1 -Create` — and never create projects in the project manager |

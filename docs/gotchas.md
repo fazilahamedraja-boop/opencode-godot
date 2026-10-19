@@ -86,3 +86,28 @@ Related: if you point `godot-ensure.ps1` at a project while another editor is
 open, the refusal only fires when that editor is actually attached to *this*
 bridge port. Editing the dial port (via `GODOT_MCP_BRIDGE_PORT` +
 `GODOT_MCP_BRIDGE_URL`) lets two services coexist on one machine.
+
+## 9. A fresh Windows profile refuses to run any of this
+
+The default execution policy is `Restricted`, so `.\install.ps1` dies with
+*"running scripts is disabled on this system"*. A script that arrived inside a
+downloaded ZIP is blocked twice over, because Mark-of-the-Web also blocks it
+under the more common `RemoteSigned`. Both are per-process problems with a
+per-process answer:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File <script>
+```
+
+`install.cmd` and `uninstall.cmd` exist only to do that, and the skill uses the
+same form for `godot-ensure.ps1` and `godot-journal.ps1`, because the agent's
+shell can be just as locked down as the user's.
+
+## 10. An existing MCP entry can point at a dead port
+
+A `godot` entry in `opencode.json` is not proof that opencode can reach the
+service. If the entry's URL and the service port diverge — typically after
+changing `GODOT_MCP_HTTP_PORT` — the tools simply never appear, and nothing
+fails loudly. `godot-doctor.ps1` compares the two, and `install.ps1
+-PatchOpencode` rewrites the URL to the current port instead of reporting
+"already configured".

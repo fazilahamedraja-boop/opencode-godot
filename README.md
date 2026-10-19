@@ -34,34 +34,69 @@ Plus the skill and `/game` command that carry the authoring recipe.
 
 ## Requirements
 
-| | |
-|---|---|
-| OS | **Windows 10/11** (v1 — see [Platform support](#platform-support)) |
-| Godot | 4.4+ (developed and verified on **4.7.2**) |
-| Python | 3.10+ with [`uv`](https://docs.astral.sh/uv/) on `PATH` |
-| opencode | V2 (verified on 2.0.32) |
-| Node | 18+ (only for the health probe) |
+| | | |
+|---|---|---|
+| OS | **Windows 10/11** (v1 — see [Platform support](#platform-support)) | no admin needed |
+| Godot | 4.4+ (developed and verified on **4.7.2**) | [download](https://godotengine.org/download/windows/), unzip anywhere |
+| [uv](https://docs.astral.sh/uv/) | the only real prerequisite | it brings its own Python; you do **not** need to install Python |
+| [opencode](https://opencode.ai) | V2 (verified on 2.0.32) | |
+| Node | 18+ | optional, only for `-Verify` and the probe |
+
+### First-time setup, in order
+
+A fresh Windows box needs four things and nothing else. No admin rights.
 
 ```powershell
-uv tool install godot-editor-mcp      # the MCP server (pinned 2026.10.15 in addon/VERSION)
+# 1. uv (a small Python tool runner - no Python install required)
+winget install --id=astral-sh.uv -e
+#    no winget?  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. open a NEW terminal so PATH picks uv up, then install the MCP server
+uv tool install godot-editor-mcp
+
+# 3. Godot: download the Windows .zip from godotengine.org and unzip it somewhere
+#    normal (Downloads is fine - the scripts look there, or pass -GodotExe).
+
+# 4. opencode: install it, then come back here
 ```
 
+If you skip something, the installer or `godot-ensure.ps1` says what is missing and
+prints the exact command — it does not fail silently or dump a stack trace.
+
 ## Install
+
+The beginner path is the `.cmd` wrapper. A fresh Windows profile refuses to run
+`.ps1` files ("running scripts is disabled on this system"), and files downloaded
+from the internet are blocked as well; `install.cmd` runs PowerShell with a
+per-process `-ExecutionPolicy Bypass`, which touches **no** machine policy.
+
+```text
+download the ZIP from GitHub, unzip it, double-click install.cmd
+```
+
+Or from a shell:
 
 ```powershell
 git clone https://github.com/fazilahamedraja-boop/opencode-godot
 cd opencode-godot
-.\install.ps1 -PatchOpencode -Verify
+.\install.cmd -PatchOpencode -InstallServer -Verify
 ```
 
-`-PatchOpencode` adds the remote server to your `opencode.json`, creating the file
-if you do not have one yet and backing up an existing one first. Without it, the
-installer only prints the snippet it would have added.
+| flag | what it does |
+|---|---|
+| `-PatchOpencode` | adds the remote server to `opencode.json` (creates the file if you have none, backs up an existing one) |
+| `-InstallServer` | runs `uv tool install godot-editor-mcp` for you |
+| `-Verify` | probes the service and prints its version, tool count and bridge state |
+| `-NoAutostart` / `-NoService` | skip the logon shortcut / skip starting the service |
+
+Scripted or advanced use can call `install.ps1` directly; `install.cmd` only adds
+the execution-policy bypass and passes every argument through.
 
 What lands where (default `%USERPROFILE%\.config\opencode`):
 
 ```
 scripts\godot-ensure.ps1          four-link readiness, one command
+scripts\godot-doctor.ps1          one-block environment report (good for bug reports)
 scripts\godot-new-project.ps1     addon + [editor_plugins] + runtime probe
 scripts\godot-journal.ps1         -Tail N  /  -Append
 scripts\godot-mcp-service.cmd     the one long-lived HTTP service
@@ -131,12 +166,16 @@ bridge (with `--require-bridge`).
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `running scripts is disabled on this system` | default Windows execution policy, or a downloaded file carrying Mark-of-the-Web | use `install.cmd`, or call the script as `powershell -NoProfile -ExecutionPolicy Bypass -File <script>` |
+| `NOT READY - the godot-editor-mcp server is missing` | step 2 of setup was skipped | `uv tool install godot-editor-mcp` (no uv: `winget install --id=astral-sh.uv -e`) |
+| `Godot is not installed, or it is somewhere this script cannot guess` | the ZIP was unpacked somewhere unusual | `-GodotExe "<path>\Godot_v4.x-stable_win64_console.exe"`, or set `GODOT_BIN` |
 | `godot tools missing` in opencode | the `godot` MCP entry is missing or the client cached a dead server | `opencode reload`; check `opencode.json` has the remote URL |
 | `bridge_bind_error 10048` | two servers racing for `:9080` | use the remote service, never a stdio `local` entry |
 | MCP dock missing after setup | `[editor_plugins]` written while the editor was open | `godot-ensure.ps1 -Restart` |
 | Tools work, then stop | the service restarted | re-enable toolsets (they are in-memory) |
 | `VALIDATION_ERROR ... expected -35, got -34.999996` | the write succeeded; vector read-back compares exactly | see [docs/gotchas.md](docs/gotchas.md#1-a-false-validation_error-after-a-vector-write-succeeds) |
 | Second editor has no tools | the bridge is single-connection | close the other editor |
+| anything else | — | run `godot-doctor.ps1` and paste its one block |
 
 ## Platform support
 
