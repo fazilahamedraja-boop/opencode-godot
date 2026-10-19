@@ -54,8 +54,9 @@ cd opencode-godot
 .\install.ps1 -PatchOpencode -Verify
 ```
 
-`-PatchOpencode` adds the remote server to your `opencode.json` (backing it up
-first). Without it, the installer only prints the snippet it would have added.
+`-PatchOpencode` adds the remote server to your `opencode.json`, creating the file
+if you do not have one yet and backing up an existing one first. Without it, the
+installer only prints the snippet it would have added.
 
 What lands where (default `%USERPROFILE%\.config\opencode`):
 

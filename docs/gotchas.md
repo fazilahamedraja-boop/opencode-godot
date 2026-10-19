@@ -73,3 +73,16 @@ The addon reconnects by itself (`_RETRY_MIN 0.5` → `_RETRY_MAX 5.0`, so within
 about five seconds). opencode's MCP client recovers on the next call. This is
 *not* true of a failure at client startup, which is sticky until the client is
 reloaded.
+
+## 8. One editor window can be two processes
+
+Godot's `*_console.exe` is a small launcher that starts the real editor as its
+own child, so a single window shows up twice in `Get-Process` / CIM queries.
+Never count processes to decide how many editors are open, and never wait on the
+launcher's PID: the **child** is the process that owns the bridge socket.
+`godot-ensure.ps1` drops the launcher for exactly this reason.
+
+Related: if you point `godot-ensure.ps1` at a project while another editor is
+open, the refusal only fires when that editor is actually attached to *this*
+bridge port. Editing the dial port (via `GODOT_MCP_BRIDGE_PORT` +
+`GODOT_MCP_BRIDGE_URL`) lets two services coexist on one machine.
