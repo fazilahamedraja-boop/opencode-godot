@@ -94,17 +94,25 @@ function Test-PortListening {
 function Get-GodotEditors {
     # Every Godot process launched with --path, flagged as editor or game.
     $result = @()
-    $procs = Get-CimInstance Win32_Process -Filter "Name LIKE 'Godot%'" -ErrorAction SilentlyContinue
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'Godot%'" -ErrorAction SilentlyContinue)
     foreach ($p in $procs) {
         $cl = $p.CommandLine
         if (-not $cl) { continue }
         if ($cl -notmatch '--path\s+(?:"([^"]+)"|(\S+))') { continue }
         $path = $Matches[1]
         if ([string]::IsNullOrEmpty($path)) { $path = $Matches[2] }
+        $isEditor = ($cl -match '\s-e(ditor)?(\s|$)')
+
+        # Godot's *_console.exe is a launcher: it starts the real editor as its own
+        # child, so ONE window shows up as two processes. Drop the launcher and keep
+        # the child - the child is the process that owns the bridge socket. Match on
+        # the name so the child of an F5 game run is never mistaken for a launcher.
+        if ($p.Name -match '_console' -and @($procs | Where-Object { $_.ParentProcessId -eq $p.ProcessId }).Count -gt 0) { continue }
+
         $result += [pscustomobject]@{
             OwnerPid    = $p.ProcessId
             ProjectPath = ($path -replace '/', '\').TrimEnd('\')
-            IsEditor    = ($cl -match '\s-e(ditor)?(\s|$)')
+            IsEditor    = $isEditor
         }
     }
     return $result

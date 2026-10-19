@@ -231,9 +231,20 @@ $snippet = @"
 "@
 
 if (-not (Test-Path -LiteralPath $cfg)) {
-    Say ''
-    Say 'opencode.json : not found here - add this to your config:' 'Yellow'
-    Say $snippet 'DarkGray'
+    if ($PatchOpencode) {
+        # A fresh opencode install usually has no opencode.json yet (it is created on
+        # demand), so "patch" has to mean "create" here or the flag silently no-ops
+        # for exactly the people it is meant for.
+        $body = "{`r`n  `"mcp`": {`r`n    `"godot`": { `"type`": `"remote`", `"url`": `"http://127.0.0.1:$svcPort/mcp`" }`r`n  }`r`n}`r`n"
+        [System.IO.File]::WriteAllText($cfg, $body, (New-Object System.Text.UTF8Encoding($false)))
+        Say ''
+        Say 'opencode.json : created with the "godot" remote server' 'Green'
+    }
+    else {
+        Say ''
+        Say 'opencode.json : not found here - add this to your config:' 'Yellow'
+        Say $snippet 'DarkGray'
+    }
 }
 else {
     $raw = Get-Content -LiteralPath $cfg -Raw
@@ -251,7 +262,7 @@ else {
         else {
             Copy-Item -LiteralPath $cfg -Destination "$cfg.bak-opencode-godot" -Force
 
-            $entry = '"godot": { "type": "remote", "url": "http://127.0.0.1:9090/mcp" }'
+            $entry = '"godot": { "type": "remote", "url": "http://127.0.0.1:' + $svcPort + '/mcp" }'
             $parsedBefore = $null
             try { $parsedBefore = $raw | ConvertFrom-Json } catch { }
 
