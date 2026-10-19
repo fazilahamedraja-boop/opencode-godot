@@ -107,7 +107,25 @@ godot-mcp-addon\godot_mcp\        pinned addon copy used for new projects
 ```
 
 Re-running the installer is safe: identical files are left alone, changed ones are
-backed up to `.bak` first. `.\uninstall.ps1` reverses it and keeps your journal.
+backed up to `.bak` first. `.\uninstall.cmd` reverses it and keeps your journal.
+
+### Checking another machine
+
+On a second PC (or a fresh VM) the whole readiness question is one block:
+
+```powershell
+git clone https://github.com/fazilahamedraja-boop/opencode-godot
+cd opencode-godot
+.\install.cmd -InstallServer -PatchOpencode -Verify
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\godot-doctor.ps1
+```
+
+`godot-doctor.ps1` needs no Node and changes nothing: it reports the OS, the
+persistent execution-policy scopes, whether uv / the server / Godot / Node are
+present, whether `opencode.json` points at the port the service is actually on,
+the service and bridge state, and the addon version — then ends in `READY` or
+`NOT READY` with a matching exit code. Paste that block into an issue if
+anything is off.
 
 ## Use
 
@@ -187,6 +205,29 @@ autostart) and is very welcome as a PR.
 
 The parts that are already portable: the skill, the command, the journal format,
 the probe (`node`), and the opencode config snippet.
+
+### What is actually verified
+
+Measured on a redirected profile with no prerequisites on `PATH`, installing from
+a clean clone of this repository on freshly chosen ports:
+
+| step | result |
+|---|---|
+| `install.cmd -InstallServer` (83 packages, no Python pre-installed) | 36.7 s, exit 0 |
+| `godot-ensure.ps1 -Create` with Godot only in `Downloads` | 14.5 s, `BRIDGE CONNECTED` |
+| `godot-doctor.ps1` | `READY`, addon `2026.10.15` |
+| real MCP authoring batch (5 commands) | `ok_all: true`, 601 ms |
+| `install.cmd -PatchOpencode` on a config with a theme + another server | valid JSON, both preserved |
+| install → uninstall | 115 files in, 0 out, exit 0 |
+
+Reproduced first and fixed in the same pass: default-policy refusal
+(`running scripts is disabled`), missing `uv` with a one-step hint that cannot
+work, a cheerful `Done.` on a setup with no server, a stack trace instead of a
+message when Godot is absent, and an MCP entry left pointing at a stale port.
+
+**Not verified here:** a second physical machine, Windows 10 or 11 on a
+different build, a real reboot firing the logon autostart, and macOS/Linux.
+`godot-doctor.ps1` exists to make that verification one command.
 
 ## Docs
 
