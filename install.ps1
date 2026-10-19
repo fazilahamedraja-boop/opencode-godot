@@ -163,7 +163,19 @@ if ($NoAutostart) {
     Say 'Autostart: skipped (-NoAutostart)' 'DarkGray'
 }
 else {
+    # Redirected or roaming AppData can make this return an empty string, and
+    # Join-Path on '' throws a cryptic binding error mid-install. Autostart is a
+    # convenience, not a requirement: say so and carry on.
     $startup = [Environment]::GetFolderPath('Startup')
+    if (-not $startup) {
+        Say ''
+        Say 'Autostart: skipped - the Startup folder could not be resolved' 'Yellow'
+        Say '           start the service by hand, or add the .cmd to your own startup:' 'DarkGray'
+        Say ("           {0}" -f (Join-Path $ConfigRoot 'scripts\godot-mcp-service.cmd')) 'DarkGray'
+        $startup = $null
+    }
+}
+if ($startup -and -not $NoAutostart) {
     $vbs = Join-Path $startup 'godot-mcp-service.vbs'
     $cmdPath = Join-Path $ConfigRoot 'scripts\godot-mcp-service.cmd'
     $body = "' Auto-started at logon: one long-lived Godot Editor MCP service.`r`n"
