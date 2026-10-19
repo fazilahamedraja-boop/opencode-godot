@@ -4,11 +4,20 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   parse:
+    name: syntax, launchers, vendored addon
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: PowerShell scripts parse
         shell: pwsh
@@ -55,3 +64,19 @@ jobs:
           if (-not (Test-Path 'addon/LICENSE')) { throw 'addon/LICENSE is missing (MIT attribution required)' }
           $count = (Get-ChildItem 'addon/godot_mcp' -Recurse -File).Count
           Write-Host "ok: $count addon files"
+
+  test:
+    name: installer, config and uninstaller behaviour
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Runs the real scripts in throwaway directories. No Godot, no uv install,
+      # no server start, no binding of 9090/9080. The suite ends with an
+      # isolation audit that fails if anything outside the temp tree changed.
+      - name: Regression tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
+          exit $LASTEXITCODE
