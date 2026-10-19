@@ -146,9 +146,13 @@ connection from the running editor, so a listening port alone says nothing about
 whether Godot is connected. Paste the whole block into an issue if anything is off.
 
 It also prints an `install` row: `install.ps1` leaves `scripts\.install-source.json`
-naming the checkout it installed from and a SHA-256 per installed file, so the
-doctor can tell you that your installed copies were edited here, or that the
-checkout has gained a fix you never installed. Drift is information, not a
+naming the checkout it installed from, and for each installed file both its
+SHA-256 and the file in the checkout it came from, so the doctor can tell you
+that your installed copies were edited here, or that the checkout has gained a
+fix you never installed. The source path is recorded rather than derived because
+the two layouts differ on purpose — the repo's `skill\` installs to `skills\` and
+`command\` to `commands\` — and a mismatch there is reported as its own thing,
+not as drift. Drift is information, not a
 failure — it never changes the verdict or the exit code, because a working box
 with hand-edited scripts is not a broken box. The addon tree is not recorded: it
 is a pinned vendor copy, and a difference there is normal.
