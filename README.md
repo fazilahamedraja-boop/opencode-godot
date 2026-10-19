@@ -129,9 +129,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\godot-doctor.ps1
 `godot-doctor.ps1` needs no Node and changes nothing: it reports the OS, the
 persistent execution-policy scopes, whether uv / the server / Godot / Node are
 present, whether `opencode.json` points at the port the service is actually on,
-the service and bridge state, and the addon version — then ends in `READY` or
-`NOT READY` with a matching exit code. Paste that block into an issue if
-anything is off.
+the service and bridge state, and the addon version. It ends in one of three
+verdicts, and the exit code matches the verdict:
+
+| Verdict | Exit | Meaning |
+|---|---|---|
+| `READY` | 0 | every prerequisite is present and an editor is attached |
+| `ALMOST` | 0 | the tools are installed, but no editor is attached yet |
+| `NOT READY` | 1 | something is missing or broken (the count is on the line) |
+
+The service row and the bridge row are deliberately separate. A healthy service on
+the port with no editor attached is `ALMOST`, not a failure: the service is a local
+HTTP server that can be up on its own, while the bridge is the *addon's* outbound
+connection from the running editor, so a listening port alone says nothing about
+whether Godot is connected. Paste the whole block into an issue if anything is off.
 
 ## Use
 

@@ -3,9 +3,21 @@
   Report whether this machine is ready to build games in Godot from opencode.
 
 .DESCRIPTION
-  Read-only. Prints one block you can copy into a chat or an issue, then exits:
-    0 = everything the workflow needs is present (bridge may still be down)
-    1 = something is missing
+  Read-only. Prints one block you can copy into a chat or an issue, then exits.
+
+    READY       exit 0  every prerequisite is present AND an editor is attached
+    ALMOST      exit 0  the tools are installed, no editor is attached yet
+    NOT READY   exit 1  something is missing or broken (the count is on the line)
+
+  ALMOST exits 0 on purpose: "open the project in Godot" is a runtime step, not
+  an installation failure, and a script that gates on this must not read it as
+  one. Only a missing prerequisite, a config that points at the wrong port, an
+  unreachable service or a failed handshake produce NOT READY.
+
+  Two different things are reported separately and must not be conflated:
+  the HTTP service being available (port listening + handshake answered), and
+  the Godot editor bridge being connected (an editor actually attached). The
+  service can be perfectly healthy with no editor anywhere, which is ALMOST.
 
   Needs no Node: the MCP handshake is done with Invoke-WebRequest.
 
@@ -25,7 +37,10 @@ $base = if ($env:GODOT_MCP_URL) { $env:GODOT_MCP_URL } else { "http://127.0.0.1:
 $configRoot = if ($env:OPENCODE_GODOT_CONFIG) { $env:OPENCODE_GODOT_CONFIG } else { Join-Path $env:USERPROFILE '.config\opencode' }
 
 $rows = [System.Collections.Generic.List[string]]::new()
+# $bad counts things that are missing or broken: prerequisites, config, service.
+# $attached is runtime state, tracked separately - see the verdict below.
 $bad = 0
+$attached = $false
 
 function Row { param([string]$Name, [string]$Value, [bool]$Ok = $true)
     if (-not $Ok) { $script:bad++ }
@@ -150,7 +165,12 @@ if ($listening) {
 if ($init) {
     Row 'server' ("{0} {1}" -f $init.result.serverInfo.name, $init.result.serverInfo.version)
     if ($health) {
-        Row 'bridge' $(if ($health.bridge_connected) { "CONNECTED (addon $($health.addon_version))" } else { 'no editor attached - open the project in Godot' }) ([bool]$health.bridge_connected)
+        $attached = [bool]$health.bridge_connected
+        # Deliberately NOT counted in $bad. An unattached editor is the normal
+        # state on a machine that is installed but idle, and counting it here is
+        # what made the ALMOST verdict unreachable: $bad -eq 0 then implied the
+        # bridge was up, so the READY branch always won and ALMOST was dead code.
+        Row 'bridge' ($(if ($attached) { "CONNECTED (addon $($health.addon_version))" } else { 'no editor attached - open the project in Godot' })) $true
     }
     else {
         Row 'bridge' 'unknown - godot_health_check did not answer' $false
@@ -160,15 +180,14 @@ if ($init) {
 # ---------------------------------------------------------------- verdict
 $rows | ForEach-Object { Write-Host "  $_" }
 Write-Host ''
-$bridgeUp = [bool]($health -and $health.bridge_connected)
-if ($bad -eq 0 -and $bridgeUp) {
+if ($bad -gt 0) {
+    Write-Host "  NOT READY - $bad item(s) above need attention." -ForegroundColor Red
+    exit 1
+}
+if ($attached) {
     Write-Host '  READY - opencode can build games here right now.' -ForegroundColor Green
     exit 0
 }
-if ($bad -eq 0 -and $server -and $godot -and $listening) {
-    Write-Host '  ALMOST - tools are installed; the editor is not attached yet.' -ForegroundColor Yellow
-    Write-Host '           open the project in Godot, or run godot-ensure.ps1.' -ForegroundColor Yellow
-    exit 0
-}
-Write-Host "  NOT READY - $bad item(s) above need attention." -ForegroundColor Red
-exit 1
+Write-Host '  ALMOST - tools are installed; the editor is not attached yet.' -ForegroundColor Yellow
+Write-Host '           open the project in Godot, or run godot-ensure.ps1.' -ForegroundColor Yellow
+exit 0
