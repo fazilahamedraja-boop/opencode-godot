@@ -685,6 +685,271 @@ Test-Case 'the .cmd wrappers propagate the real exit code' {
     Assert-Missing (Join-Path $cfg 'scripts\godot-ensure.ps1') 'uninstall.cmd did not remove the files'
 }
 
+Test-Case 'a fresh profile installs to the default config root and can be cleaned' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+
+    # No -ConfigRoot at all: %USERPROFILE%\.config\opencode is the documented
+    # default, and a machine that has never run opencode has no such directory.
+    $envMap = Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir)
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-PatchOpencode', '-NoService', '-NoAutostart') -Environment $envMap
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+
+    $cfg = Join-Path $fakeHome '.config\opencode'
+    Assert-Exists (Join-Path $cfg 'opencode.json') 'no opencode.json at the default config root'
+    Assert-Exists (Join-Path $cfg 'scripts\godot-ensure.ps1') 'the scripts were not installed'
+    Assert-Exists (Join-Path $cfg 'scripts\godot-doctor.ps1') 'the doctor was not installed'
+    Assert-Exists (Join-Path $cfg 'skills\godot-game-by-prompt\SKILL.md') 'the skill was not installed'
+    Assert-Exists (Join-Path $cfg 'commands\game.md') 'the command was not installed'
+    Assert-Exists (Join-Path $cfg 'godot-mcp-addon\godot_mcp\plugin.cfg') 'the addon was not installed'
+
+    $json = ConvertFrom-JsonFile (Join-Path $cfg 'opencode.json')
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the default install points somewhere else'
+
+    # -NoAutostart must mean what it says, and nothing may leak into the profile.
+    Assert-Missing (Join-Path $fakeHome 'godot-mcp-service.vbs') 'an autostart entry appeared despite -NoAutostart'
+
+    # The same profile must be returnable to a clean state without -ConfigRoot.
+    $u = Invoke-Og -Path (Join-Path $RepoRoot 'uninstall.ps1') -Environment $envMap
+    Assert-Equal 0 $u.ExitCode ("uninstall exited {0}: {1}" -f $u.ExitCode, (Get-Tail $u.Output))
+    Assert-Missing (Join-Path $cfg 'scripts\godot-ensure.ps1') 'uninstall did not remove the scripts'
+    Assert-Missing (Join-Path $cfg 'godot-mcp-addon') 'uninstall did not remove the addon'
+    Assert-Missing (Join-Path $cfg 'commands\game.md') 'uninstall did not remove the command'
+    Assert-Missing (Join-Path $cfg 'skills\godot-game-by-prompt') 'uninstall did not remove the skill'
+
+    $left = @(Get-ChildItem -LiteralPath $cfg -Recurse -File -Force)
+    Assert-Equal 1 $left.Count 'uninstall left more than the config file behind'
+    Assert-Equal 'opencode.json' $left[0].Name 'uninstall removed the config it is supposed to keep'
+}
+
+Test-Case 'an empty mcp block gains the godot entry and stays valid JSON' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+
+    # The other common fresh shape: opencode.json exists, but no MCP server has
+    # ever been added, so the block is `{}` and must not gain a trailing comma.
+    $cfgFile = Join-Path $cfg 'opencode.json'
+    $original = @'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  "mcp": {}
+}
+'@
+    [System.IO.File]::WriteAllText($cfgFile, $original, (New-Object System.Text.UTF8Encoding($false)))
+    $before = Get-Sha $cfgFile
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') `
+        -Environment (Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir))
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'added the "godot" remote server' $r.Output 'the empty mcp block was not patched'
+
+    $json = ConvertFrom-JsonFile $cfgFile
+    Assert-Equal 'tokyonight' $json.theme 'theme was not preserved'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the godot entry is missing'
+    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'the empty mcp block gained more than one server'
+    Assert-NotMatch ',\s*\}' (Get-Content -LiteralPath $cfgFile -Raw) 'a trailing comma would break strict JSON parsers'
+    Assert-Equal $before (Get-Sha "$cfgFile.bak-opencode-godot") 'the backup is not byte-identical to the original'
+}
+
+Test-Case 'Godot is found in Downloads and -NoLaunch reports it without launching' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+
+    # Hold the service port so godot-ensure.ps1 takes its "already listening"
+    # branch and starts nothing. If something else already owns the port the
+    # effect is the same, so a failed bind is not a failure.
+    $listener = $null
+    try {
+        $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 9599)
+        $listener.Start()
+    }
+    catch { $listener = $null }
+
+    try {
+        # The beginner case: a ZIP unpacked two levels down in Downloads.
+        $godotDir = Join-Path $fakeHome 'Downloads\Godot 4.7.2'
+        New-Item -ItemType Directory -Force -Path $godotDir | Out-Null
+        $fakeGodot = Join-Path $godotDir 'Godot_v4.7.2-stable_win64_console.exe'
+        [IO.File]::WriteAllText($fakeGodot, 'stub - -NoLaunch never executes this')
+
+        $proj = Join-Path $dir 'proj'
+        $envMap = @{
+            USERPROFILE           = $fakeHome
+            LOCALAPPDATA          = (Join-Path $fakeHome 'AppData\Local')
+            ProgramFiles          = (Join-Path $fakeHome 'pf')
+            'ProgramFiles(x86)'   = (Join-Path $fakeHome 'pf86')
+            GODOT_MCP_HTTP_PORT   = '9599'
+            GODOT_MCP_BRIDGE_PORT = '9580'
+            GODOT_MCP_SERVER_EXE  = (New-StubServer -Dir $dir)
+            # No Godot on PATH: the point is the Downloads fallback, and PATH
+            # wins over it by design.
+            PATH                  = (Get-MinimalPath)
+        }
+        $r = Invoke-Og -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') `
+            -Arguments @('-Create', '-NoLaunch', '-ProjectPath', $proj, '-TimeoutSec', '3') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("godot-ensure exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match ([regex]::Escape("godot: $fakeGodot")) $r.Output 'the exe unpacked in Downloads was not reported'
+        Assert-Exists (Join-Path $proj 'project.godot') 'the project was not created'
+        Assert-Exists (Join-Path $proj 'addons\godot_mcp\plugin.cfg') 'the addon was not provisioned'
+
+        # The same empty machine with no Godot at all: provisioning still
+        # succeeds, but the run says up front that the editor cannot be launched.
+        $bare = Join-Path $dir 'home-bare'
+        New-Item -ItemType Directory -Force -Path $bare | Out-Null
+        $bareMap = @{
+            USERPROFILE           = $bare
+            LOCALAPPDATA          = (Join-Path $bare 'AppData\Local')
+            ProgramFiles          = (Join-Path $bare 'pf')
+            'ProgramFiles(x86)'   = (Join-Path $bare 'pf86')
+            GODOT_MCP_HTTP_PORT   = '9599'
+            GODOT_MCP_BRIDGE_PORT = '9580'
+            GODOT_MCP_SERVER_EXE  = $envMap['GODOT_MCP_SERVER_EXE']
+            PATH                  = (Get-MinimalPath)
+        }
+        $r2 = Invoke-Og -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') `
+            -Arguments @('-Create', '-NoLaunch', '-ProjectPath', (Join-Path $dir 'proj2'), '-TimeoutSec', '3') -Environment $bareMap
+        Assert-Equal 0 $r2.ExitCode ("godot-ensure exited {0} without Godot: {1}" -f $r2.ExitCode, (Get-Tail $r2.Output))
+        Assert-Match 'godot: NOT FOUND' $r2.Output 'a missing Godot was not reported'
+        Assert-Match 'pass -GodotExe' $r2.Output 'the fix was not offered'
+    }
+    finally {
+        if ($listener) { $listener.Stop() }
+    }
+}
+
+Test-Case '-InstallServer without uv stops before touching the config' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    $envMap = @{
+        USERPROFILE          = $fakeHome
+        GODOT_MCP_SERVER_EXE = ''
+        GODOT_MCP_HTTP_PORT  = '9599'
+        PATH                 = (Get-MinimalPath)
+    }
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-InstallServer', '-NoService', '-NoAutostart') -Environment $envMap
+
+    Assert-Equal 1 $r.ExitCode ("a run that cannot install the server must exit 1, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'needs uv, and uv is not installed' $r.Output 'uv was not named'
+    Assert-Match 'winget install --id=astral-sh\.uv -e' $r.Output 'the first command was not offered'
+    Assert-Match 'astral\.sh/uv/install\.ps1' $r.Output 'the alternative install was not offered'
+    Assert-NotMatch 'Done\.' $r.Output 'the installer claimed success'
+    Assert-Missing $cfg 'the config directory was created before the run knew it could not finish'
+    Assert-NotMatch 'At line:|CategoryInfo' $r.Output 'the run crashed with a stack trace'
+}
+
+Test-Case 'a GODOT_MCP_SERVER_EXE pointing nowhere is not treated as installed' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    $envMap = @{
+        USERPROFILE          = $fakeHome
+        GODOT_MCP_SERVER_EXE = (Join-Path $dir 'uninstalled\godot-editor-mcp.exe')
+        GODOT_MCP_HTTP_PORT  = '9599'
+        PATH                 = (Get-MinimalPath)
+    }
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-NoService', '-NoAutostart') -Environment $envMap
+
+    Assert-Equal 1 $r.ExitCode ("a stale override must not pass for an installed server, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'mcp server : NOT INSTALLED' $r.Output 'the missing server was not reported'
+    Assert-Match 'NOT READY' $r.Output 'the run did not end with NOT READY'
+}
+
+Test-Case 'the doctor reports a bare machine honestly and agrees with the installer' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $port = 9597
+    $envMap = @{
+        USERPROFILE           = $fakeHome
+        LOCALAPPDATA          = (Join-Path $fakeHome 'AppData\Local')
+        ProgramFiles          = (Join-Path $fakeHome 'pf')
+        'ProgramFiles(x86)'   = (Join-Path $fakeHome 'pf86')
+        GODOT_MCP_HTTP_PORT   = "$port"
+        GODOT_MCP_BRIDGE_PORT = '9587'
+        PATH                  = (Get-MinimalPath)
+    }
+
+    $bare = Invoke-Og -Path (Join-Path $RepoRoot 'scripts\godot-doctor.ps1') -Arguments @('-TimeoutSec', '1') -Environment $envMap
+    Assert-Equal 1 $bare.ExitCode ("the doctor must fail a bare machine, got {0}: {1}" -f $bare.ExitCode, (Get-Tail $bare.Output))
+    Assert-Match '(?m)^\s*uv\s+MISSING' $bare.Output 'uv was not reported missing'
+    Assert-Match '(?m)^\s*mcp server\s+MISSING' $bare.Output 'the missing server was not reported'
+    Assert-Match '(?m)^\s*godot\s+MISSING' $bare.Output 'the missing Godot was not reported'
+    Assert-Match 'no file at' $bare.Output 'the missing opencode.json was not reported'
+    Assert-Match 'NOT READY' $bare.Output 'the verdict was not NOT READY'
+    Assert-NotMatch 'At line:|CategoryInfo' $bare.Output 'the doctor crashed with a stack trace'
+
+    # Install with the server supplied through the override, then ask again.
+    $installMap = @{
+        USERPROFILE          = $fakeHome
+        GODOT_MCP_SERVER_EXE = (New-StubServer -Dir $dir)
+        GODOT_MCP_HTTP_PORT  = "$port"
+    }
+    $i = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-PatchOpencode', '-NoService', '-NoAutostart') -Environment $installMap
+    Assert-Equal 0 $i.ExitCode ("installer exited {0}: {1}" -f $i.ExitCode, (Get-Tail $i.Output))
+
+    $envMap['GODOT_MCP_SERVER_EXE'] = $installMap['GODOT_MCP_SERVER_EXE']
+    $after = Invoke-Og -Path (Join-Path $RepoRoot 'scripts\godot-doctor.ps1') -Arguments @('-TimeoutSec', '1') -Environment $envMap
+    Assert-Match ([regex]::Escape("http://127.0.0.1:$port/mcp")) $after.Output 'the doctor did not show the configured url'
+    Assert-NotMatch 'config port' $after.Output 'the doctor and the installer disagree about the port'
+    Assert-NotMatch '(?m)^\s*mcp server\s+MISSING' $after.Output 'the doctor ignored a GODOT_MCP_SERVER_EXE the installer accepted'
+}
+
+Test-Case 'spaces, unicode and brackets in the config path are handled' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+
+    # Built from code points so this file stays pure ASCII: Windows PowerShell
+    # 5.1 reads a BOM-less .ps1 as ANSI, which would corrupt a literal umlaut.
+    $name = 'opencode cfg T' + [char]0x00EB + 'st ' + [char]0x65E5 + [char]0x672C + [char]0x8A9E + ' [x]'
+    $cfg = Join-Path $dir $name
+    $envMap = Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir)
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') -Environment $envMap
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+
+    # The directory really carries the requested name, not a mangled version.
+    Assert-Equal $cfg (Get-Item -LiteralPath $cfg).FullName 'the config directory name was mangled'
+
+    $nested = 'handlers\batch.gd'
+    $installedNested = Join-Path $cfg "godot-mcp-addon\godot_mcp\$nested"
+    Assert-Exists $installedNested 'a nested addon file is missing'
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot "addon\godot_mcp\$nested")) (Get-Sha $installedNested) 'a nested addon file was copied incorrectly'
+
+    $json = ConvertFrom-JsonFile (Join-Path $cfg 'opencode.json')
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the url is wrong in that path'
+
+    # A second run must still recognise the addon as unchanged there.
+    $again = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') -Environment $envMap
+    Assert-Equal 0 $again.ExitCode ("second install exited {0}: {1}" -f $again.ExitCode, (Get-Tail $again.Output))
+    Assert-Match '= godot-mcp-addon\\godot_mcp' $again.Output 'the addon was not recognised as unchanged in that path'
+}
+
 # ================================================================== isolation audit
 
 if ($script:Index -eq 0) {
