@@ -83,8 +83,11 @@ Remove-EmptyDir -Path (Join-Path $ConfigRoot 'scripts')
 
 # Only remove the logon shortcut if it points at THIS install. Deleting another
 # install's autostart because you uninstalled a test copy is not acceptable.
-$vbs = Join-Path ([Environment]::GetFolderPath('Startup')) 'godot-mcp-service.vbs'
-if (Test-Path -LiteralPath $vbs) {
+# A redirected profile can resolve this to '', and Join-Path on '' throws a
+# binding error mid-uninstall - install.ps1 already guards the same case.
+$startupDir = [Environment]::GetFolderPath('Startup')
+$vbs = if ($startupDir) { Join-Path $startupDir 'godot-mcp-service.vbs' } else { '' }
+if ($vbs -and (Test-Path -LiteralPath $vbs)) {
     $content = Get-Content -LiteralPath $vbs -Raw
     if ($content -like "*$ConfigRoot*") {
         Remove-Target -Path $vbs -Label 'Startup\godot-mcp-service.vbs'

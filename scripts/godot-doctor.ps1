@@ -54,16 +54,31 @@ Row 'policy' ("machine={0}  user={1}  (this process: {2})" -f $polMachine, $polU
 $uv = Find-Tool 'uv' (Join-Path $env:USERPROFILE '.local\bin\uv.exe')
 Row 'uv' ($(if ($uv) { $uv } else { 'MISSING - winget install --id=astral-sh.uv -e' })) ([bool]$uv)
 
-$server = Find-Tool 'godot-editor-mcp' (Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe')
+# Same order as install.ps1 and godot-ensure.ps1: an explicit override first, so
+# the doctor never reports MISSING on a machine those two are happy with.
+$server = $null
+if ($env:GODOT_MCP_SERVER_EXE -and (Test-Path -LiteralPath $env:GODOT_MCP_SERVER_EXE)) { $server = $env:GODOT_MCP_SERVER_EXE }
+if (-not $server) { $server = Find-Tool 'godot-editor-mcp' (Join-Path $env:USERPROFILE '.local\bin\godot-editor-mcp.exe') }
 Row 'mcp server' ($(if ($server) { $server } else { 'MISSING - uv tool install godot-editor-mcp' })) ([bool]$server)
 
 $godot = $env:GODOT_BIN
 if (-not $godot) { $godot = Find-Tool 'godot_console' $null }
 if (-not $godot) { $godot = Find-Tool 'godot' $null }
 if (-not $godot) {
-    foreach ($d in @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop'), (Join-Path $env:USERPROFILE 'godot'))) {
+    # Same directories, filter and "newest first" pick as godot-ensure.ps1, so
+    # the two can never disagree about which copy of the editor is in use.
+    $godotDirs = @(
+        (Join-Path $env:USERPROFILE 'Downloads'),
+        (Join-Path $env:USERPROFILE 'Desktop'),
+        (Join-Path $env:USERPROFILE 'godot'),
+        (Join-Path $env:LOCALAPPDATA 'Programs'),
+        (Join-Path ${env:ProgramFiles} 'Godot'),
+        (Join-Path ${env:ProgramFiles} 'Godot Engine')
+    )
+    foreach ($d in $godotDirs) {
         if (-not (Test-Path -LiteralPath $d)) { continue }
-        $hit = Get-ChildItem $d -Filter 'Godot_v*-stable_win64*.exe' -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
+        $hit = Get-ChildItem $d -Filter 'Godot_v*-stable_win64*.exe' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
         if ($hit) { $godot = $hit.FullName; break }
     }
 }

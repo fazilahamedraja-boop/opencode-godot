@@ -129,14 +129,17 @@ function Get-GodotEditors {
     return $result
 }
 
-function Resolve-GodotExe {
+function Find-GodotExe {
+    # Returns a path, or $null when nothing matches. Never fails: -NoLaunch uses
+    # this to report readiness up front, instead of letting a fresh machine find
+    # out on the next run - after the addon has already been copied.
     if ($GodotExe) {
-        if (-not (Test-Path -LiteralPath $GodotExe)) { Fail "Godot exe not found at -GodotExe '$GodotExe'." @() 5 }
-        return $GodotExe
+        if (Test-Path -LiteralPath $GodotExe) { return $GodotExe }
+        return $null
     }
     if ($env:GODOT_BIN) {
-        if (-not (Test-Path -LiteralPath $env:GODOT_BIN)) { Fail "GODOT_BIN points at '$env:GODOT_BIN', which does not exist." @() 5 }
-        return $env:GODOT_BIN
+        if (Test-Path -LiteralPath $env:GODOT_BIN) { return $env:GODOT_BIN }
+        return $null
     }
 
     # 1. on PATH (the console build prints CLI output, so prefer it)
@@ -163,6 +166,17 @@ function Resolve-GodotExe {
         if ($hit) { return $hit.FullName }
     }
 
+    return $null
+}
+
+function Resolve-GodotExe {
+    $found = Find-GodotExe
+    if ($found) { return $found }
+
+    # Keep the specific diagnosis when an explicit path was configured and is
+    # wrong - "not installed" would send the user looking in the wrong place.
+    if ($GodotExe) { Fail "Godot exe not found at -GodotExe '$GodotExe'." @() 5 }
+    if ($env:GODOT_BIN) { Fail "GODOT_BIN points at '$env:GODOT_BIN', which does not exist." @() 5 }
     Fail "Godot is not installed, or it is somewhere this script cannot guess." @(
         'download: https://godotengine.org/download/windows/  (unzip anywhere)',
         'then either:  -GodotExe "C:\path\to\Godot_v4.x-stable_win64_console.exe"',
@@ -273,6 +287,17 @@ New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 if ($NoLaunch) {
     Write-Host ""
     Write-Step "PREPARED (not launched) - $proj"
+    # Say now whether the editor can be found. The first run on a fresh machine
+    # is often -NoLaunch, and discovering two steps later that Godot is in a
+    # place this script does not look is a bad surprise.
+    $detected = Find-GodotExe
+    if ($detected) {
+        Write-Step "godot: $detected"
+    }
+    else {
+        Write-Step "godot: NOT FOUND - the next run cannot launch the editor"
+        Write-Step "       pass -GodotExe, set GODOT_BIN, or put Godot on PATH"
+    }
     exit 0
 }
 
