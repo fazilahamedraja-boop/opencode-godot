@@ -241,7 +241,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
 
 It ends with an isolation audit: if anything under your real
 `~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
-the run fails. CI runs the same suite on `windows-latest`.
+the run fails. CI runs the same 17 tests on two clean Windows images
+(`windows-2022` and `windows-2025`), under both Windows PowerShell 5.1 and
+PowerShell 7.
 
 ## Docs
 
