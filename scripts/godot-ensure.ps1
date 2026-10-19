@@ -271,20 +271,37 @@ if ($mine.Count -ge 1 -and $needsRestart) {
 }
 elseif ($mine.Count -eq 0) {
     if ($other.Count -gt 0) {
-        # One editor owns the bridge. Launching a second gives two addons on :9080
-        # and the loser is silently dead, which looks like "the plugin is missing".
-        if (-not $Restart) {
-            Write-Host ""
-            Write-Step "BLOCKED: an editor is already open on a different project:"
-            Write-Step "  $($other[0].ProjectPath)"
-            Write-Step "one editor owns bridge port $bridgePort. Close it, or re-run with -Restart (loses unsaved work)."
-            exit 4
+        # One editor owns the bridge - but only if it is actually attached to THIS
+        # bridge port. A second service on another port is a supported setup, and
+        # an editor that never connected is not an owner either; blocking for those
+        # claims a conflict that does not exist.
+        $attached = @(
+            Get-NetTCPConnection -RemotePort $bridgePort -State Established -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.OwningProcess }
+        )
+        $racing = @($other | Where-Object {
+                if ($attached -contains $_.OwnerPid) { return $true }
+                # A window that started seconds ago may not have dialled yet.
+                $p = Get-Process -Id $_.OwnerPid -ErrorAction SilentlyContinue
+                return ($p -and $p.StartTime -gt (Get-Date).AddSeconds(-20))
+            })
+        if ($racing.Count -gt 0) {
+            if (-not $Restart) {
+                Write-Host ""
+                Write-Step "BLOCKED: an editor is already open on a different project:"
+                Write-Step "  $($racing[0].ProjectPath)"
+                Write-Step "one editor owns bridge port $bridgePort. Close it, or re-run with -Restart (loses unsaved work)."
+                exit 4
+            }
+            foreach ($o in $racing) {
+                Write-Step "closing editor on $($o.ProjectPath) (pid $($o.OwnerPid))"
+                Stop-Process -Id $o.OwnerPid -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 2
         }
-        foreach ($o in $other) {
-            Write-Step "closing editor on $($o.ProjectPath) (pid $($o.OwnerPid))"
-            Stop-Process -Id $o.OwnerPid -Force -ErrorAction SilentlyContinue
+        else {
+            Write-Step "another editor is open but not attached to bridge port $bridgePort - continuing"
         }
-        Start-Sleep -Seconds 2
     }
     Start-Editor -Project $proj -Exe (Resolve-GodotExe)
 }
