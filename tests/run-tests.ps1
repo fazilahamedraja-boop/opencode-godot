@@ -799,7 +799,12 @@ Test-Case 'Godot is found in Downloads and -NoLaunch reports it without launchin
         $r = Invoke-Og -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') `
             -Arguments @('-Create', '-NoLaunch', '-ProjectPath', $proj, '-TimeoutSec', '3') -Environment $envMap
         Assert-Equal 0 $r.ExitCode ("godot-ensure exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
-        Assert-Match ([regex]::Escape("godot: $fakeGodot")) $r.Output 'the exe unpacked in Downloads was not reported'
+        # Compare by identity, not by string: a CI runner's %TEMP% is the 8.3
+        # form (RUNNER~1), so the same file legitimately prints two ways.
+        $reported = [regex]::Match($r.Output, 'godot: (.+\.exe)').Groups[1].Value
+        Assert-Match 'godot: .*\\Downloads\\Godot 4\.7\.2\\Godot_v4\.7\.2-stable_win64_console\.exe' $r.Output 'the exe unpacked in Downloads was not reported'
+        Assert-Exists $reported 'the reported path does not exist'
+        Assert-Equal (Get-Sha $fakeGodot) (Get-Sha $reported) 'the reported path is not the copy in Downloads'
         Assert-Exists (Join-Path $proj 'project.godot') 'the project was not created'
         Assert-Exists (Join-Path $proj 'addons\godot_mcp\plugin.cfg') 'the addon was not provisioned'
 
@@ -933,7 +938,9 @@ Test-Case 'spaces, unicode and brackets in the config path are handled' {
     Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
 
     # The directory really carries the requested name, not a mangled version.
-    Assert-Equal $cfg (Get-Item -LiteralPath $cfg).FullName 'the config directory name was mangled'
+    # Leaf only: %TEMP% is the 8.3 form on a runner, so the same path prints
+    # with RUNNER~1 in one place and the full user name in another.
+    Assert-Equal $name (Split-Path -Leaf (Get-Item -LiteralPath $cfg).FullName) 'the config directory name was mangled'
 
     $nested = 'handlers\batch.gd'
     $installedNested = Join-Path $cfg "godot-mcp-addon\godot_mcp\$nested"
