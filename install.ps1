@@ -83,23 +83,39 @@ function Install-File {
 
 function Install-Tree {
     param([string]$From, [string]$To, [string]$Label)
-    # Compare relative paths + hashes, so a re-run can report "unchanged" honestly.
-    $fingerprint = {
-        (Get-ChildItem $To -Recurse -File | Sort-Object FullName | Get-FileHash |
-            ForEach-Object { $_.Path.Substring($To.Length) + ':' + $_.Hash }) -join "`n"
-    }
 
     $existed = Test-Path -LiteralPath $To
     if (-not $existed) { New-Item -ItemType Directory -Force -Path $To | Out-Null }
-    $before = if ($existed) { & $fingerprint } else { $null }
 
-    # Copy the CONTENTS. `Copy-Item -Recurse -Destination <existing dir>` would nest
-    # the source inside it ($To\godot_mcp\godot_mcp), which duplicated the whole tree.
-    Copy-Item -Path (Join-Path $From '*') -Destination $To -Recurse -Force
+    # Compare relative paths + SHA-256 and copy only what is missing or differs.
+    # Copy-Item -Force over an identical file still rewrites it, which makes a
+    # running Godot editor rescan the whole addon for nothing - so "unchanged"
+    # has to mean untouched, not merely "same hash afterwards".
+    $copied = 0
+    $kept = 0
+    foreach ($source in Get-ChildItem -LiteralPath $From -Recurse -File) {
+        $rel = $source.FullName.Substring($From.Length).TrimStart('\')
+        $dest = Join-Path $To $rel
+        $destDir = Split-Path -Parent $dest
+        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+
+        if (Test-Path -LiteralPath $dest) {
+            if ((Get-FileHash -LiteralPath $source.FullName).Hash -eq (Get-FileHash -LiteralPath $dest).Hash) {
+                $kept++
+                continue
+            }
+            Copy-Item -LiteralPath $source.FullName -Destination $dest -Force
+            $copied++
+        }
+        else {
+            Copy-Item -LiteralPath $source.FullName -Destination $dest -Force
+            $copied++
+        }
+    }
 
     if (-not $existed) { Say ("  + {0}" -f $Label) 'Green'; return }
-    if ($before -eq (& $fingerprint)) { Say ("  = {0}" -f $Label); return }
-    Say ("  ~ {0}  (updated in place)" -f $Label) 'Yellow'
+    if ($copied -eq 0) { Say ("  = {0}" -f $Label); return }
+    Say ("  ~ {0}  ({1} file(s) updated, {2} unchanged)" -f $Label, $copied, $kept) 'Yellow'
 }
 
 # ---------------------------------------------------------------- preflight
