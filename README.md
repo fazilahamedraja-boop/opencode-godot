@@ -255,19 +255,27 @@ different build, a real reboot firing the logon autostart, and macOS/Linux.
 
 ## Tests
 
-The installer, the `opencode.json` handling, addon provisioning and the
+The installer, the `opencode.json` handling, addon provisioning, the addon upgrade
+path (in the installer and again inside a project), editor-process detection and the
 uninstaller have a regression suite that runs the real scripts in throwaway
-directories — no Godot, no server start, no ports bound:
+directories:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
+No Godot editor and no real MCP service take part. Two fakes stand in where the real
+thing is not needed: a stub MCP service on private ports (9587 and 9595–9597) that
+answers exactly the two requests `godot-doctor.ps1` makes, and renamed copies of
+`powershell.exe` launched with Godot-shaped command lines so the process detector is
+driven by real `Win32_Process` data. Neither is the behaviour under test; they are
+what lets it run with no Godot installed.
+
 It ends with an isolation audit: if anything under your real
 `~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
-the run fails. CI runs the same 17 tests on two clean Windows images
-(`windows-2022` and `windows-2025`), under both Windows PowerShell 5.1 and
-PowerShell 7.
+the run fails (the stubs use private ports, which the audit does not watch). CI
+runs the same 24 tests on two clean Windows images (`windows-2022` and
+`windows-2025`), under both Windows PowerShell 5.1 and PowerShell 7.
 
 ## Docs
 

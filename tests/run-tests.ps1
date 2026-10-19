@@ -16,6 +16,12 @@
         and, with -NoService, never executes it.
       * GODOT_MCP_HTTP_PORT  -> a port number that is never bound, because every
         install runs with -NoService.
+      * A stub MCP service (Start-FakeMcpServer) on a private port, answering the
+        two requests the doctor makes, so READY / ALMOST are reachable without a
+        real service or a real editor.
+      * Renamed copies of powershell.exe, launched with Godot-like command lines,
+        to exercise the process detector against real Win32_Process data. They
+        are not Godot: no editor, no bridge, no project.
 
     Written for Windows PowerShell 5.1 (the version users have) and also runs
     under PowerShell 7. No Pester dependency.
@@ -139,7 +145,10 @@ function Invoke-Og {
         [Parameter(Mandatory = $true)][string]$Path,
         [string[]]$Arguments = @(),
         [hashtable]$Environment = @{},
-        [switch]$ViaCmd
+        [switch]$ViaCmd,
+        # Run the child under another PowerShell host (e.g. pwsh), so a check can
+        # be run under both 5.1 and 7 without changing this helper.
+        [string]$HostPath = ''
     )
 
     $saved = @{}
@@ -156,7 +165,7 @@ function Invoke-Og {
             $argv = @('/c', $Path) + $Arguments
         }
         else {
-            $exe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $exe = if ($HostPath) { $HostPath } else { Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe' }
             if (-not (Test-Path -LiteralPath $exe)) { Fail "Windows PowerShell not found at $exe" }
             $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path) + $Arguments
         }
@@ -212,6 +221,145 @@ function Get-TreeHashes {
     @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
         Sort-Object FullName |
         ForEach-Object { $_.FullName.Substring($Path.Length) + '|' + (Get-Sha $_.FullName) })
+}
+
+<#
+    Lift named functions out of a shipped script without running it.
+
+    The scripts are top-level programs - dot-sourcing godot-ensure.ps1 would
+    prepare a project - so the function bodies are taken from the AST and defined
+    in this session. That keeps the code under test the REAL code instead of a
+    copy pasted into the suite, where it could drift from the scripts.
+#>
+function Import-ScriptFunction {
+    param([string]$Path, [string[]]$Name)
+
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+    $defs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+    $loaded = @()
+    foreach ($fn in $defs) {
+        if ($Name -notcontains $fn.Name) { continue }
+        # Body.Extent.Text keeps the outer braces, and a scriptblock built from
+        # "{ ... }" evaluates to a nested ScriptBlock instead of running the body.
+        $body = $fn.Body.Extent.Text
+        if ($body.StartsWith('{') -and $body.EndsWith('}')) {
+            $body = $body.Substring(1, $body.Length - 2)
+        }
+        Set-Item -Path ("function:global:{0}" -f $fn.Name) -Value ([scriptblock]::Create($body))
+        $loaded += $fn.Name
+    }
+    foreach ($want in $Name) {
+        if ($loaded -notcontains $want) { Fail ("no function {0} in {1}" -f $want, $Path) }
+    }
+}
+
+function Wait-PortState {
+    param([int]$Port, [bool]$Listening, [int]$TimeoutSec = 20)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $hit = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        if ($hit -eq $Listening) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+<#
+    A stub MCP service: it answers exactly the two requests godot-doctor.ps1 makes
+    (initialize, then tools/call godot_health_check), so the READY / ALMOST
+    verdicts can be exercised with no real service and no real editor.
+
+    A raw TcpListener rather than HttpListener: HttpListener wants a URL ACL that
+    a non-admin cannot grant, a TcpListener needs nothing. It runs in a job
+    because it has to stay alive while the doctor runs as a child process, and it
+    accepts with Pending() polling rather than a blocking AcceptTcpClient so that
+    Stop-Job can always end it. After MaxRequests it exits on its own.
+#>
+function Start-FakeMcpServer {
+    param([int]$Port, [bool]$BridgeConnected, [int]$MaxRequests = 4)
+
+    Start-Job -ArgumentList $Port, $BridgeConnected, $MaxRequests -ScriptBlock {
+        param($Port, $BridgeConnected, $MaxRequests)
+
+        $healthJson = '{"bridge_connected":' + $(if ($BridgeConnected) { 'true' } else { 'false' }) +
+            ',"addon_version":"' + $(if ($BridgeConnected) { '2026.10.15' } else { '' }) + '"}'
+        $init = '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"godot-editor-mcp","version":"stub"}}}'
+        $tool = (@{ jsonrpc = '2.0'; id = 2; result = @{ content = @(@{ type = 'text'; text = $healthJson }) } } |
+            ConvertTo-Json -Depth 8 -Compress) -replace "`r?`n", ''
+
+        # A previous stub's port may still be closing; retry the bind.
+        $listener = $null
+        for ($attempt = 0; $attempt -lt 40 -and -not $listener; $attempt++) {
+            try {
+                $candidate = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
+                $candidate.Start()
+                $listener = $candidate
+            }
+            catch { Start-Sleep -Milliseconds 250 }
+        }
+        if (-not $listener) { throw "the stub could not bind 127.0.0.1:$Port" }
+
+        try {
+            $served = 0
+            $deadline = (Get-Date).AddSeconds(120)
+            while ($served -lt $MaxRequests -and (Get-Date) -lt $deadline) {
+                if (-not $listener.Pending()) { Start-Sleep -Milliseconds 50; continue }
+                $client = $listener.AcceptTcpClient()
+                try {
+                    $stream = $client.GetStream()
+                    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
+                    $length = 0
+                    while ($true) {
+                        $line = $reader.ReadLine()
+                        if ($null -eq $line -or $line -eq '') { break }
+                        if ($line -match '(?i)^Content-Length:\s*(\d+)') { $length = [int]$Matches[1] }
+                    }
+                    $body = ''
+                    if ($length -gt 0) {
+                        $chars = New-Object char[] $length
+                        $read = 0
+                        while ($read -lt $length) {
+                            $n = $reader.Read($chars, $read, $length - $read)
+                            if ($n -le 0) { break }
+                            $read += $n
+                        }
+                        if ($read -gt 0) { $body = -join $chars[0..($read - 1)] }
+                    }
+                    $payload = if ($body -match 'tools/call') { 'data: ' + $tool } else { 'data: ' + $init }
+                    $bytes = [System.Text.Encoding]::ASCII.GetBytes($payload)
+                    $head = "HTTP/1.1 200 OK`r`nContent-Type: text/event-stream`r`nmcp-session-id: stub-session`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+                    $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                    $stream.Write($headBytes, 0, $headBytes.Length)
+                    $stream.Write($bytes, 0, $bytes.Length)
+                    $stream.Flush()
+                    $served++
+                }
+                finally { $client.Close() }
+            }
+        }
+        finally { $listener.Stop() }
+    }
+}
+
+function Stop-FakeMcpServer {
+    param($Job)
+    if (-not $Job) { return }
+    Stop-Job -Job $Job -ErrorAction SilentlyContinue
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+}
+
+<#
+    Backstop for the process test: kill anything whose command line carries this
+    test's unique marker, so a failed run cannot leave a fake "Godot" behind on
+    the machine for later tests to trip over.
+#>
+function Stop-MarkedProcess {
+    param([string]$Marker)
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+        if ($p.CommandLine -and $p.CommandLine.Contains($Marker)) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 # ------------------------------------------------------------------ runner
@@ -574,6 +722,66 @@ Test-Case 'addon provisioning detects missing and modified files by hash' {
     Assert-Equal (Get-Sha (Join-Path $addon 'type_coerce.gd')) (Get-Sha $tampered) 'the modified file was not restored'
     Assert-Equal $projectHash (Get-Sha $projectFile) 'project.godot was rewritten during the repair'
     Assert-Equal 1 (@(Get-ChildItem -LiteralPath $proj -Filter 'project.godot.bak-*')).Count 'the repair wrote another backup'
+}
+
+Test-Case 'addon provisioning backs up a hand-edited file instead of overwriting it' {
+    param($dir)
+
+    $proj = Join-Path $dir 'proj'
+    New-Item -ItemType Directory -Force -Path $proj | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $proj 'project.godot'),
+        "config_version=5`r`n`r`n[application]`r`n`r`nconfig/name=`"test`"`r`n")
+
+    $addon = Join-Path $RepoRoot 'addon\godot_mcp'
+    $sourceCount = @(Get-ChildItem -LiteralPath $addon -Recurse -File).Count
+    $provision = Join-Path $RepoRoot 'scripts\godot-new-project.ps1'
+    $args = @('-ProjectPath', $proj, '-AddonSource', $addon)
+    $dest = Join-Path $proj 'addons\godot_mcp'
+
+    $first = Invoke-Og -Path $provision -Arguments $args
+    Assert-Equal 0 $first.ExitCode ("provisioning exited {0}: {1}" -f $first.ExitCode, (Get-Tail $first.Output))
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $dest -Recurse -File -Filter '*.bak*')).Count `
+        'the first provisioning backed something up'
+
+    # A hand edit to a shipped handler, plus the user's own handler. The first is an
+    # upgrade of a file provisioning owns; the second upstream does not ship at all.
+    $edited = Join-Path $dest 'handlers\batch.gd'
+    $edit1 = "# user edit 1`n"
+    [System.IO.File]::WriteAllText($edited, $edit1)
+
+    $stray = Join-Path $dest 'handlers\user-added.gd'
+    [System.IO.File]::WriteAllText($stray, 'user file')
+
+    $neighbour = Join-Path $dest 'type_coerce.gd'
+    # Read the stamp back after setting it: [datetime]'...Z' carries a Kind the
+    # property does not preserve, and the raw comparison then reports a change
+    # that never happened (the same trick the addon-upgrade test uses).
+    (Get-Item -LiteralPath $neighbour).LastWriteTimeUtc = $script:Sentinel
+    $neighbourStamp = (Get-Item -LiteralPath $neighbour).LastWriteTimeUtc
+
+    $second = Invoke-Og -Path $provision -Arguments $args
+    Assert-Equal 0 $second.ExitCode ("the repair exited {0}: {1}" -f $second.ExitCode, (Get-Tail $second.Output))
+    # The reported count is what the destination holds afterwards - the upstream
+    # files plus the user's own handler - with backups deliberately excluded from it.
+    Assert-Match ([regex]::Escape("copied $($sourceCount + 1) files")) $second.Output 'the addon file count is wrong'
+    Assert-Match '1 replaced file\(s\) backed up as \.bak' $second.Output 'the provisioning did not report the backup'
+    Assert-Equal (Get-Sha (Join-Path $addon 'handlers\batch.gd')) (Get-Sha $edited) 'the edited addon file was not restored'
+    Assert-Exists "$edited.bak" 'the edited addon file was replaced with no backup'
+    Assert-Equal $edit1 ([System.IO.File]::ReadAllText("$edited.bak")) 'the backup does not hold the previous contents'
+    Assert-Equal $neighbourStamp (Get-Item -LiteralPath $neighbour).LastWriteTimeUtc 'an unchanged addon file was rewritten'
+    Assert-Equal 'user file' ([System.IO.File]::ReadAllText($stray)) 'provisioning deleted a file upstream does not ship'
+    Assert-Missing "$stray.bak" 'a file upstream does not ship was backed up as if it had been replaced'
+
+    # A second edit must not clobber the first backup: after two upgrades it is the
+    # only copy of what the file originally was.
+    $edit2 = "# user edit 2`n"
+    [System.IO.File]::WriteAllText($edited, $edit2)
+    $third = Invoke-Og -Path $provision -Arguments $args
+    Assert-Equal 0 $third.ExitCode ("the second repair exited {0}: {1}" -f $third.ExitCode, (Get-Tail $third.Output))
+    Assert-Equal (Get-Sha (Join-Path $addon 'handlers\batch.gd')) (Get-Sha $edited) 'the second edit was not restored'
+    Assert-Equal $edit1 ([System.IO.File]::ReadAllText("$edited.bak")) 'a later provisioning overwrote the earlier backup'
+    Assert-Equal $edit2 ([System.IO.File]::ReadAllText("$edited.bak.1")) 'the second edit was not backed up'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $dest -Recurse -File -Filter '*.partial')).Count 'a partial-copy artifact was left behind'
 }
 
 Test-Case 'uninstall removes only integration-owned files' {
@@ -955,6 +1163,395 @@ Test-Case 'spaces, unicode and brackets in the config path are handled' {
         -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') -Environment $envMap
     Assert-Equal 0 $again.ExitCode ("second install exited {0}: {1}" -f $again.ExitCode, (Get-Tail $again.Output))
     Assert-Match '= godot-mcp-addon\\godot_mcp' $again.Output 'the addon was not recognised as unchanged in that path'
+}
+
+# ================================================================== editor detection
+
+Test-Case 'editor detection: -e, -editor, --editor, and games that are not editors' {
+    param($dir)
+
+    Import-ScriptFunction -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') `
+        -Name @('Split-GodotCommandLine', 'ConvertFrom-GodotCommandLine')
+
+    # Command lines shaped like the ones Godot produces: the executable first,
+    # --path in either quoting, the editor flag at the end.
+    $runs = @(
+        @{ Line = '"C:\Godot\godot.exe" --path "C:\My Games\proj" -e';        Editor = $true;  Path = 'C:\My Games\proj' },
+        @{ Line = 'godot.exe --path C:\proj -e';                              Editor = $true;  Path = 'C:\proj' },
+        @{ Line = '"C:\Program Files\Godot\godot.exe" --path C:\proj -editor'; Editor = $true; Path = 'C:\proj' },
+        @{ Line = 'godot.exe --path "C:\My Games\proj" --editor';             Editor = $true;  Path = 'C:\My Games\proj' },
+        @{ Line = '"C:\Godot\godot.exe" --path "C:\My Games\proj"';           Editor = $false; Path = 'C:\My Games\proj' },
+        @{ Line = 'godot.exe --path C:\proj';                                 Editor = $false; Path = 'C:\proj' },
+        @{ Line = 'godot.exe --path C:\proj --verbose --fullscreen';           Editor = $false; Path = 'C:\proj' },
+        # A path is data, never a flag. These two were read as editors before,
+        # which is what made a running game look like the editor.
+        @{ Line = 'godot.exe --path "C:\my -e games\proj"';                    Editor = $false; Path = 'C:\my -e games\proj' },
+        @{ Line = 'godot.exe --path "C:\a --editor b\proj"';                   Editor = $false; Path = 'C:\a --editor b\proj' },
+        # Separator handling is unchanged.
+        @{ Line = 'godot.exe --path C:/games/proj -e';                         Editor = $true;  Path = 'C:\games\proj' },
+        @{ Line = 'godot.exe --path "C:\games\proj\" -e';                      Editor = $true;  Path = 'C:\games\proj' }
+    )
+    foreach ($run in $runs) {
+        $parsed = ConvertFrom-GodotCommandLine -CommandLine $run.Line
+        Assert-True ($null -ne $parsed) ("not recognised as a Godot run: {0}" -f $run.Line)
+        Assert-Equal $run.Path $parsed.ProjectPath ("wrong project path for: {0}" -f $run.Line)
+        Assert-Equal $run.Editor $parsed.IsEditor ("wrong editor flag for: {0}" -f $run.Line)
+    }
+
+    # Not a --path run at all: the process is skipped, never guessed at.
+    foreach ($line in @(
+            'godot.exe --editor',
+            'godot.exe --path=C:\proj -e',   # the equals form was never supported
+            'notepad.exe C:\notes.txt',
+            ''
+        )) {
+        Assert-True ($null -eq (ConvertFrom-GodotCommandLine -CommandLine $line)) ("should not classify: '{0}'" -f $line)
+    }
+}
+
+Test-Case 'editor detection: a console launcher is dropped, its child is kept' {
+    param($dir)
+
+    Import-ScriptFunction -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') -Name @('Select-GodotHostProcess')
+
+    # A console-build launch is two processes: the launcher, and the child that
+    # actually owns the bridge. One window must not count as two.
+    $table = @(
+        [pscustomobject]@{ Name = 'Godot_v4.7.2-stable_win64_console.exe'; ProcessId = 100; ParentProcessId = 1 },
+        [pscustomobject]@{ Name = 'Godot_v4.7.2-stable_win64.exe';         ProcessId = 101; ParentProcessId = 100 },
+        [pscustomobject]@{ Name = 'Godot_v4.7.2-stable_win64_console.exe'; ProcessId = 102; ParentProcessId = 1 }
+    )
+    $kept = @(Select-GodotHostProcess -Processes $table)
+    Assert-Equal 2 $kept.Count 'a console launcher that has a child was not dropped'
+    Assert-True ($kept.ProcessId -contains 101) 'the launcher child was dropped too'
+    Assert-True ($kept.ProcessId -contains 102) 'a childless console build was dropped'
+    Assert-True ($kept.ProcessId -notcontains 100) 'the launcher was kept'
+
+    # The F5 game is a child of the editor, and a console build of a game has no
+    # children: being a child is not a reason to drop a process, being a launcher is.
+    $gameTree = @(
+        [pscustomobject]@{ Name = 'Godot_v4.7.2-stable_win64.exe';         ProcessId = 200; ParentProcessId = 1 },
+        [pscustomobject]@{ Name = 'Godot_v4.7.2-stable_win64_console.exe'; ProcessId = 201; ParentProcessId = 200 }
+    )
+    $keptGame = @(Select-GodotHostProcess -Processes $gameTree)
+    Assert-Equal 2 $keptGame.Count 'a childless console build of a game was dropped'
+}
+
+Test-Case 'editor detection: real processes, and a running game is not an editor' {
+    param($dir)
+
+    Import-ScriptFunction -Path (Join-Path $RepoRoot 'scripts\godot-ensure.ps1') `
+        -Name @('Split-GodotCommandLine', 'ConvertFrom-GodotCommandLine', 'Select-GodotHostProcess', 'Get-GodotEditors')
+
+    # The detector filters on the process NAME and reads the real command line, so
+    # a renamed copy of the Windows PowerShell host is indistinguishable from
+    # Godot to it. This drives Win32_Process, the actual command line and the real
+    # parent/child tree - not a simulated table. It is still not a real Godot: no
+    # editor, no bridge, no project.
+    $tools = Join-Path $dir 'tools'
+    New-Item -ItemType Directory -Force -Path $tools | Out-Null
+    $hostExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $editorExe = Join-Path $tools 'Godot_v4.7.2-stable_win64.exe'
+    $launcherExe = Join-Path $tools 'Godot_v4.7.2-stable_win64_console.exe'
+    Copy-Item -LiteralPath $hostExe -Destination $editorExe
+    Copy-Item -LiteralPath $hostExe -Destination $launcherExe
+
+    $sleeper = Join-Path $tools 'sleep.ps1'
+    [System.IO.File]::WriteAllText($sleeper, 'Start-Sleep -Seconds 90')
+
+    $token = 'C:\og-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $editorProj = "$token editor proj"
+    $gameProj = "$token game proj"
+    $launchProj = "$token launcher proj"
+
+    # The launcher starts the real editor as its child and then stays alive, which
+    # is what godot_console.exe does.
+    $launchTemplate = @'
+$child = Join-Path $PSScriptRoot 'Godot_v4.7.2-stable_win64.exe'
+$sleeper = Join-Path $PSScriptRoot 'sleep.ps1'
+$childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $sleeper + '"'), '--path', ('__PROJ__'), '-e')
+Start-Process -FilePath $child -WindowStyle Hidden -ArgumentList $childArgs
+Start-Sleep -Seconds 90
+'@
+    $launchScript = Join-Path $tools 'launch.ps1'
+    [System.IO.File]::WriteAllText($launchScript, $launchTemplate.Replace('__PROJ__', '"' + $launchProj + '"'))
+
+    $commonArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden')
+    $launcher = $null
+    try {
+        $editor = Start-Process -FilePath $editorExe -WindowStyle Hidden -PassThru -ArgumentList `
+            ($commonArgs + @('-File', ('"' + $sleeper + '"'), '--path', ('"' + $editorProj + '"'), '-e'))
+        $game = Start-Process -FilePath $editorExe -WindowStyle Hidden -PassThru -ArgumentList `
+            ($commonArgs + @('-File', ('"' + $sleeper + '"'), '--path', ('"' + $gameProj + '"')))
+        $launcher = Start-Process -FilePath $launcherExe -WindowStyle Hidden -PassThru -ArgumentList `
+            ($commonArgs + @('-File', ('"' + $launchScript + '"'), '--path', ('"' + $launchProj + '"'), '-e'))
+
+        # Wait for the launcher's child, then for the detector to name the child
+        # rather than the launcher: a childless *_console process IS kept, so the
+        # launcher is briefly the answer until the child exists.
+        $deadline = (Get-Date).AddSeconds(30)
+        $childPid = 0
+        while ((Get-Date) -lt $deadline -and $childPid -eq 0) {
+            $kids = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'Godot%'" |
+                Where-Object { $_.ParentProcessId -eq $launcher.Id })
+            if ($kids.Count -gt 0) { $childPid = $kids[0].ProcessId }
+            Start-Sleep -Milliseconds 300
+        }
+        Assert-True ($childPid -ne 0) 'the fake console launcher never started its child'
+
+        $reported = @()
+        while ((Get-Date) -lt $deadline) {
+            $reported = @(Get-GodotEditors | Where-Object { $_.ProjectPath -like "$token*" })
+            $mine = @($reported | Where-Object { $_.ProjectPath -eq $launchProj })
+            if ($reported.Count -ge 3 -and $mine.Count -eq 1 -and $mine[0].OwnerPid -eq $childPid) { break }
+            Start-Sleep -Milliseconds 300
+        }
+
+        $editorRow = @($reported | Where-Object { $_.ProjectPath -eq $editorProj })
+        Assert-Equal 1 $editorRow.Count 'the editor was not reported exactly once'
+        Assert-Equal $editor.Id $editorRow[0].OwnerPid 'the editor pid was misreported'
+        Assert-True $editorRow[0].IsEditor 'the editor was not classified as an editor'
+
+        $gameRow = @($reported | Where-Object { $_.ProjectPath -eq $gameProj })
+        Assert-Equal 1 $gameRow.Count 'the game was not reported exactly once'
+        Assert-Equal $game.Id $gameRow[0].OwnerPid 'the game pid was misreported'
+        Assert-True (-not $gameRow[0].IsEditor) 'a running game was classified as an editor'
+
+        $launchRow = @($reported | Where-Object { $_.ProjectPath -eq $launchProj })
+        Assert-Equal 1 $launchRow.Count 'the launcher pair was not reported as exactly one window'
+        Assert-Equal $childPid $launchRow[0].OwnerPid 'the console launcher was reported instead of its child'
+        Assert-True $launchRow[0].IsEditor 'the launched editor was not classified as an editor'
+    }
+    finally {
+        Stop-MarkedProcess -Marker $dir
+    }
+}
+
+# ================================================================== addon upgrade
+
+Test-Case 'addon upgrade: an edited file is backed up, an unchanged one is not' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    $envMap = Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir)
+    $install = Join-Path $RepoRoot 'install.ps1'
+    $installArgs = @('-ConfigRoot', $cfg, '-NoService', '-NoAutostart')
+
+    $first = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $first.ExitCode ("first install exited {0}: {1}" -f $first.ExitCode, (Get-Tail $first.Output))
+
+    $addon = Join-Path $cfg 'godot-mcp-addon\godot_mcp'
+    $edited = Join-Path $addon 'plugin.cfg'
+    $untouched = Join-Path $addon 'handlers\batch.gd'
+    Assert-Exists $edited 'the addon was not installed at all'
+
+    # 1. Nothing changed: files must not be rewritten, and no backup appears.
+    (Get-Item -LiteralPath $edited).LastWriteTimeUtc = $script:Sentinel
+    $editedStamp = (Get-Item -LiteralPath $edited).LastWriteTimeUtc
+    (Get-Item -LiteralPath $untouched).LastWriteTimeUtc = $script:Sentinel
+    $untouchedStamp = (Get-Item -LiteralPath $untouched).LastWriteTimeUtc
+
+    $second = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $second.ExitCode ("second install exited {0}: {1}" -f $second.ExitCode, (Get-Tail $second.Output))
+    Assert-Equal $editedStamp (Get-Item -LiteralPath $edited).LastWriteTimeUtc 'an unchanged addon file was rewritten'
+    Assert-Equal $untouchedStamp (Get-Item -LiteralPath $untouched).LastWriteTimeUtc 'an unchanged addon file was rewritten'
+    Assert-Missing "$edited.bak" 'a backup was written although nothing changed'
+    Assert-Match '= godot-mcp-addon\\godot_mcp' $second.Output 'the addon was not reported as unchanged'
+
+    # 2. A file missing from the destination is new, not an upgrade: it is copied
+    #    and not backed up. A file upstream no longer ships is left alone - there
+    #    is no manifest, so it could equally be the user's own handler.
+    $stray = Join-Path $addon 'handlers\user-added.gd'
+    [System.IO.File]::WriteAllText($stray, 'user file')
+    Remove-Item -LiteralPath $untouched -Force
+
+    $third = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $third.ExitCode ("third install exited {0}: {1}" -f $third.ExitCode, (Get-Tail $third.Output))
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot 'addon\godot_mcp\handlers\batch.gd')) (Get-Sha $untouched) 'a file missing from the destination was not restored'
+    Assert-Missing "$untouched.bak" 'a newly installed file was backed up as if it had been replaced'
+    Assert-Equal 'user file' ([System.IO.File]::ReadAllText($stray)) 'a file upstream does not ship was deleted by the installer'
+
+    # 3. A modified addon file is replaced AND its previous contents survive: the
+    #    backup holds what was there BEFORE the upgrade, not the new contents.
+    $userEdit = "user edit 1`n"
+    [System.IO.File]::WriteAllText($edited, $userEdit)
+    $fourth = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $fourth.ExitCode ("fourth install exited {0}: {1}" -f $fourth.ExitCode, (Get-Tail $fourth.Output))
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot 'addon\godot_mcp\plugin.cfg')) (Get-Sha $edited) 'the edited addon file was not restored to the upstream copy'
+    Assert-Exists "$edited.bak" 'the edited addon file was replaced with no backup'
+    Assert-Equal $userEdit ([System.IO.File]::ReadAllText("$edited.bak")) 'the backup does not hold the previous contents'
+    Assert-Match 'backed up as \.bak' $fourth.Output 'the installer did not report the backup'
+
+    # 4. A second edit must not clobber the first backup: after two upgrades the
+    #    first backup is the only copy of what the file originally was.
+    $userEdit2 = "user edit 2`n"
+    [System.IO.File]::WriteAllText($edited, $userEdit2)
+    $fifth = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $fifth.ExitCode ("fifth install exited {0}: {1}" -f $fifth.ExitCode, (Get-Tail $fifth.Output))
+    Assert-Equal $userEdit ([System.IO.File]::ReadAllText("$edited.bak")) 'a later install overwrote the earlier backup'
+    Assert-Equal $userEdit2 ([System.IO.File]::ReadAllText("$edited.bak.1")) 'the second edit was not backed up'
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot 'addon\godot_mcp\plugin.cfg')) (Get-Sha $edited) 'the addon was not restored on the second edit'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $addon -Recurse -File -Filter '*.partial')).Count 'a partial-copy artifact was left behind'
+
+    # 5. Single files (scripts\, skills\, commands\) take the same backup path.
+    $scriptFile = Join-Path $cfg 'scripts\godot-doctor.ps1'
+    $scriptEdit = "# hand edit`n"
+    [System.IO.File]::WriteAllText($scriptFile, $scriptEdit)
+    $sixth = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $sixth.ExitCode ("sixth install exited {0}: {1}" -f $sixth.ExitCode, (Get-Tail $sixth.Output))
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot 'scripts\godot-doctor.ps1')) (Get-Sha $scriptFile) 'the edited script was not restored'
+    Assert-Equal $scriptEdit ([System.IO.File]::ReadAllText("$scriptFile.bak")) 'the edited script was replaced with no backup'
+    Assert-Match 'previous version saved as godot-doctor\.ps1\.bak' $sixth.Output 'the installer did not report the script backup'
+}
+
+Test-Case 'addon upgrade: a failed copy does not lose the edited file' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    $envMap = Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir)
+    $install = Join-Path $RepoRoot 'install.ps1'
+    $installArgs = @('-ConfigRoot', $cfg, '-NoService', '-NoAutostart')
+
+    $first = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $first.ExitCode ("first install exited {0}: {1}" -f $first.ExitCode, (Get-Tail $first.Output))
+
+    $addon = Join-Path $cfg 'godot-mcp-addon\godot_mcp'
+    $edited = Join-Path $addon 'plugin.cfg'
+    $userEdit = "user edit`n"
+    [System.IO.File]::WriteAllText($edited, $userEdit)
+
+    # Refuse writes on that one file. Hashing it and backing it up only read it,
+    # so both succeed, and the overwrite that comes after is the step that fails.
+    # An open with FileShare.Read would not do the job: Get-FileHash asks for a
+    # narrower share than that handle allows, so the run would fail before it ever
+    # reached the backup.
+    $acl = Get-Acl -LiteralPath $edited
+    $deny = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'Write', 'Deny')
+    $null = $acl.AddAccessRule($deny)
+    try {
+        Set-Acl -LiteralPath $edited -AclObject $acl
+        $failed = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    }
+    finally {
+        $restore = Get-Acl -LiteralPath $edited
+        $null = $restore.RemoveAccessRule($deny)
+        Set-Acl -LiteralPath $edited -AclObject $restore
+    }
+
+    Assert-True ($failed.ExitCode -ne 0) 'the installer reported success although it could not replace the addon file'
+    Assert-Equal $userEdit ([System.IO.File]::ReadAllText($edited)) 'the failed run damaged the edited file'
+    Assert-Exists "$edited.bak" 'the failed run left the edit with no recoverable copy'
+    Assert-Equal $userEdit ([System.IO.File]::ReadAllText("$edited.bak")) 'the backup is not a complete copy of the edit'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $addon -Recurse -File -Filter '*.partial')).Count 'a partial copy was left behind where a backup should be'
+
+    # The edit is still there afterwards, and a clean run upgrades the file.
+    $again = Invoke-Og -Path $install -Arguments $installArgs -Environment $envMap
+    Assert-Equal 0 $again.ExitCode ("the install after the failure exited {0}: {1}" -f $again.ExitCode, (Get-Tail $again.Output))
+    Assert-Equal (Get-Sha (Join-Path $RepoRoot 'addon\godot_mcp\plugin.cfg')) (Get-Sha $edited) 'the addon was not restored after the failed run'
+    Assert-Equal $userEdit ([System.IO.File]::ReadAllText("$edited.bak")) 'the edit was lost after the retry'
+}
+
+# ================================================================== doctor contract
+
+Test-Case 'doctor: READY, ALMOST and NOT READY, with service and bridge distinct' {
+    param($dir)
+
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+    $homeDir = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $homeDir | Out-Null
+
+    # The doctor only looks for the uv command, and GODOT_BIN/GODOT_MCP_SERVER_EXE
+    # are file paths it reports: stubs are enough, nothing is ever executed.
+    $bin = Join-Path $dir 'bin'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $bin 'uv.exe'), 'stub - never executed')
+    $godotStub = Join-Path $dir 'Godot_v4.7.2-stable_win64.exe'
+    [System.IO.File]::WriteAllText($godotStub, 'stub - never executed')
+    $serverStub = New-StubServer -Dir $dir
+
+    # The bridge port only has to be LISTENING for the doctor's row: a bare
+    # listener is the whole requirement, no addon involved.
+    $bridgePort = 9587
+    $bridgeListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $bridgePort)
+    $bridgeListener.Start()
+
+    $doctor = Join-Path $RepoRoot 'scripts\godot-doctor.ps1'
+    $job = $null
+    try {
+        # Each case gets its own stub on its own port, so the URL the doctor
+        # validates and the service it talks to are the same thing.
+        $cases = @(
+            @{ Port = 9597; Attached = $false; Uv = $true;  Verdict = 'ALMOST';    Exit = 0 },
+            @{ Port = 9596; Attached = $true;  Uv = $true;  Verdict = 'READY';     Exit = 0 },
+            @{ Port = 9595; Attached = $true;  Uv = $false; Verdict = 'NOT READY'; Exit = 1 }
+        )
+        foreach ($case in $cases) {
+            $label = ("port {0}, editor attached {1}, uv present {2}" -f $case.Port, $case.Attached, $case.Uv)
+
+            $json = @{ mcp = @{ godot = @{ type = 'remote'; url = "http://127.0.0.1:$($case.Port)/mcp" } } }
+            [System.IO.File]::WriteAllText((Join-Path $cfg 'opencode.json'),
+                ($json | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+
+            Stop-FakeMcpServer -Job $job
+            $job = Start-FakeMcpServer -Port $case.Port -BridgeConnected $case.Attached
+            Assert-True (Wait-PortState -Port $case.Port -Listening $true) ("the stub service never listened on port {0}" -f $case.Port)
+
+            $envMap = @{
+                USERPROFILE           = $homeDir
+                OPENCODE_GODOT_CONFIG = $cfg
+                GODOT_MCP_HTTP_PORT   = "$($case.Port)"
+                GODOT_MCP_BRIDGE_PORT = "$bridgePort"
+                GODOT_MCP_SERVER_EXE  = $serverStub
+                GODOT_BIN             = $godotStub
+                PATH                  = $(if ($case.Uv) { "$bin;$(Get-MinimalPath)" } else { Get-MinimalPath })
+            }
+
+            $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+            Assert-Equal $case.Exit $r.ExitCode ("the doctor exited {0} for {1}: {2}" -f $r.ExitCode, $label, (Get-Tail $r.Output))
+            Assert-Match ("(?m)^  {0}" -f [regex]::Escape($case.Verdict)) $r.Output ("the verdict for {0} was not {1}" -f $label, $case.Verdict)
+            Assert-NotMatch 'At line:|CategoryInfo' $r.Output ("the doctor crashed for {0}" -f $label)
+
+            # The service being available and the editor being attached are two
+            # different facts, and the report has to keep them apart.
+            Assert-Match ("service {0}\s+listening" -f $case.Port) $r.Output ("the service row is wrong for {0}" -f $label)
+            Assert-Match ("bridge {0}\s+listening" -f $bridgePort) $r.Output ("the bridge-port row is wrong for {0}" -f $label)
+            Assert-Match 'server\s+godot-editor-mcp stub' $r.Output ("the MCP handshake did not happen for {0}" -f $label)
+            if ($case.Attached) {
+                Assert-Match 'CONNECTED \(addon 2026\.10\.15\)' $r.Output ("the attached editor was not reported for {0}" -f $label)
+                # Anchored: the test's own temp directory carries the verdict
+                # words in its name, and the doctor prints paths inside it.
+                Assert-NotMatch '(?m)^  ALMOST' $r.Output ("an attached editor was reported as ALMOST for {0}" -f $label)
+            }
+            else {
+                Assert-Match 'no editor attached' $r.Output ("the missing editor was not explained for {0}" -f $label)
+                Assert-NotMatch '(?m)^  NOT READY' $r.Output ("an installed box with no editor was reported as broken for {0}" -f $label)
+            }
+            if (-not $case.Uv) {
+                Assert-Match 'uv\s+MISSING' $r.Output ("the missing prerequisite was not reported for {0}" -f $label)
+            }
+
+            # PowerShell 7 ignores -UseBasicParsing and answers the response
+            # differently, and nothing else in the suite reaches that path there.
+            if ($PSVersionTable.PSVersion.Major -ge 7) {
+                $currentHost = (Get-Process -Id $PID).Path
+                Assert-Equal 'pwsh.exe' (Split-Path -Leaf $currentHost) 'the extra run was not made with pwsh'
+                $again = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap -HostPath $currentHost
+                Assert-Equal $case.Exit $again.ExitCode ("the same check under pwsh exited {0} for {1}: {2}" -f $again.ExitCode, $label, (Get-Tail $again.Output))
+                Assert-Match ("(?m)^  {0}" -f [regex]::Escape($case.Verdict)) $again.Output ("the verdict under pwsh was not {0} for {1}" -f $case.Verdict, $label)
+                Assert-NotMatch 'At line:|CategoryInfo' $again.Output ("the doctor crashed under pwsh for {0}" -f $label)
+            }
+        }
+    }
+    finally {
+        Stop-FakeMcpServer -Job $job
+        $bridgeListener.Stop()
+    }
 }
 
 # ================================================================== isolation audit
