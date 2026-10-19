@@ -1,0 +1,91 @@
+# 0001 - Coerce.values_equal: compare the float components of composites
+#
+# An upstream proposal for hybridindie/godot-mcp. It is NOT applied to the
+# vendored tree in this repo - install.ps1 copies addon/godot_mcp verbatim, so
+# the tree stays an unmodified upstream copy. To use it locally, apply it to
+# the copy install.ps1 made for you:
+#
+#     git apply addon/patches/0001-values-equal-float-components-with-epsilon.patch
+#
+# Cut from this vendored file, at this content (the test suite checks both,
+# so bumping the vendored addon forces this patch to be refreshed):
+# target: addon/godot_mcp/type_coerce.gd
+# sha256: a0fb59a8fd68df0fc0ec884f8a7b4917ebe1a8083405a00166b37e20cb1c7e57
+#
+# Background: docs/gotchas.md, gotcha 1. Verified on Godot 4.7.2 - see the
+# session notes in the PR that offers this upstream.
+diff --git a/addon/godot_mcp/type_coerce.gd b/addon/godot_mcp/type_coerce.gd
+index 1a787b2..e6c3e83 100644
+--- a/addon/godot_mcp/type_coerce.gd
++++ b/addon/godot_mcp/type_coerce.gd
+@@ -386,6 +386,14 @@ static func _has_rect_keys(value: Variant) -> bool:
+ 	return value is Dictionary and value.has("position") and value.has("size")
+ 
+ 
++## Component-wise float comparison. A value can come back with a last-bit
++## difference after a round-trip through a coarser representation - degrees to
++## radians to degrees, or float32 storage - so a whole-value ``==`` reports a
++## write as failed that actually landed (#641). Shared by the cases below.
++static func _floats_equal(a: float, b: float, epsilon: float) -> bool:
++	return absf(a - b) <= epsilon or (is_nan(a) and is_nan(b))
++
++
+ ## Value equality for the post-set read-back check (#641): floats compare within
+ ## ``epsilon`` (recursively through dict/array shapes); int/float are interchangeable
+ ## for a numeric property; mismatched composite types differ. Used to fail a set
+@@ -399,7 +407,54 @@ static func values_equal(a: Variant, b: Variant, epsilon: float = 1e-5) -> bool:
+ 		return false
+ 	match ta:
+ 		TYPE_FLOAT:
+-			return absf(a - b) <= epsilon or (is_nan(a) and is_nan(b))
++			return _floats_equal(a, b, epsilon)
++		TYPE_VECTOR2:
++			var v2a := a as Vector2
++			var v2b := b as Vector2
++			return _floats_equal(v2a.x, v2b.x, epsilon) and _floats_equal(v2a.y, v2b.y, epsilon)
++		TYPE_VECTOR3:
++			var v3a := a as Vector3
++			var v3b := b as Vector3
++			return _floats_equal(v3a.x, v3b.x, epsilon) and _floats_equal(v3a.y, v3b.y, epsilon) and _floats_equal(v3a.z, v3b.z, epsilon)
++		TYPE_VECTOR4:
++			var v4a := a as Vector4
++			var v4b := b as Vector4
++			return _floats_equal(v4a.x, v4b.x, epsilon) and _floats_equal(v4a.y, v4b.y, epsilon) and _floats_equal(v4a.z, v4b.z, epsilon) and _floats_equal(v4a.w, v4b.w, epsilon)
++		TYPE_COLOR:
++			var ca := a as Color
++			var cb := b as Color
++			return _floats_equal(ca.r, cb.r, epsilon) and _floats_equal(ca.g, cb.g, epsilon) and _floats_equal(ca.b, cb.b, epsilon) and _floats_equal(ca.a, cb.a, epsilon)
++		TYPE_RECT2:
++			var r2a := a as Rect2
++			var r2b := b as Rect2
++			return values_equal(r2a.position, r2b.position, epsilon) and values_equal(r2a.size, r2b.size, epsilon)
++		TYPE_PLANE:
++			var pla := a as Plane
++			var plb := b as Plane
++			return values_equal(pla.normal, plb.normal, epsilon) and _floats_equal(pla.d, plb.d, epsilon)
++		TYPE_QUATERNION:
++			var qa := a as Quaternion
++			var qb := b as Quaternion
++			return _floats_equal(qa.x, qb.x, epsilon) and _floats_equal(qa.y, qb.y, epsilon) and _floats_equal(qa.z, qb.z, epsilon) and _floats_equal(qa.w, qb.w, epsilon)
++		TYPE_BASIS:
++			var ba := a as Basis
++			var bb := b as Basis
++			return values_equal(ba.x, bb.x, epsilon) and values_equal(ba.y, bb.y, epsilon) and values_equal(ba.z, bb.z, epsilon)
++		TYPE_TRANSFORM2D:
++			var t2a := a as Transform2D
++			var t2b := b as Transform2D
++			return values_equal(t2a.x, t2b.x, epsilon) and values_equal(t2a.y, t2b.y, epsilon) and values_equal(t2a.origin, t2b.origin, epsilon)
++		TYPE_TRANSFORM3D:
++			var t3a := a as Transform3D
++			var t3b := b as Transform3D
++			return values_equal(t3a.basis, t3b.basis, epsilon) and values_equal(t3a.origin, t3b.origin, epsilon)
++		TYPE_PACKED_FLOAT32_ARRAY, TYPE_PACKED_FLOAT64_ARRAY, TYPE_PACKED_VECTOR2_ARRAY, TYPE_PACKED_VECTOR3_ARRAY, TYPE_PACKED_COLOR_ARRAY:
++			if a.size() != b.size():
++				return false
++			for i in a.size():
++				if not values_equal(a[i], b[i], epsilon):
++					return false
++			return true
+ 		TYPE_DICTIONARY:
+ 			var da := a as Dictionary
+ 			var db := b as Dictionary

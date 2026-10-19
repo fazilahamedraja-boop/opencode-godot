@@ -1882,6 +1882,42 @@ Test-Case 'the scripts hash files without relying on module autoloading' {
     Assert-Equal (Get-Sha $sample) (Get-Sha256 -Path $sample) 'the helper disagrees with Get-FileHash'
 }
 
+Test-Case 'the addon patch is still cut from the vendored addon' {
+    param($dir)
+
+    # addon/patches/*.patch holds an upstream proposal that is deliberately NOT
+    # applied here: addon/VERSION promises the vendored tree is an unmodified
+    # upstream copy, and install.ps1 copies it verbatim. Each patch therefore
+    # records the file it was cut from and that file's sha256 - a patch that no
+    # longer matches is worse than no patch, because `git apply` fails partway
+    # through and reads as "the fix is broken". A vendored bump has to refresh
+    # the patch, and this test is what says so.
+    $patchDir = Join-Path $RepoRoot 'addon\patches'
+    $patches = @(Get-ChildItem -LiteralPath $patchDir -Filter '*.patch' -File -ErrorAction SilentlyContinue)
+    Assert-True ($patches.Count -ge 1) 'addon\patches holds no patch'
+
+    foreach ($patch in $patches) {
+        $text = Get-Content -LiteralPath $patch.FullName -Raw
+        $target = [regex]::Match($text, '(?m)^#\s*target:\s*(\S+)\s*$')
+        $sha = [regex]::Match($text, '(?m)^#\s*sha256:\s*([0-9a-fA-F]{64})\s*$')
+        Assert-True $target.Success ('{0}: no "# target:" line' -f $patch.Name)
+        Assert-True $sha.Success ('{0}: no "# sha256:" line' -f $patch.Name)
+
+        $rel = $target.Groups[1].Value
+        $file = Join-Path $RepoRoot ($rel -replace '/', '\')
+        Assert-Exists $file ('{0} names a file that is not in this repo' -f $patch.Name)
+        Assert-Match ('(?m)^diff --git a/{0} b/{0}$' -f [regex]::Escape($rel)) $text `
+            ('{0}: carries no diff for its own target' -f $patch.Name)
+        Assert-Equal ($sha.Groups[1].Value.ToUpperInvariant()) (Get-Sha $file) `
+            ('{0}: {1} has changed since the patch was cut - refresh the patch and its sha256' -f $patch.Name, $rel)
+    }
+
+    # The patches are for a user's installed copy, never for the repo's tree:
+    # install.ps1 has to keep copying addon/godot_mcp verbatim.
+    Assert-NotMatch 'git apply' (Get-Content -LiteralPath (Join-Path $RepoRoot 'install.ps1') -Raw) `
+        'install.ps1 applies a patch; the vendored tree must stay pristine'
+}
+
 # ================================================================== isolation audit
 
 if ($script:Index -eq 0) {

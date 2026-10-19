@@ -8,3 +8,9 @@ The vendored addon in addon/godot_mcp is an unmodified copy of the upstream
     # version="2026.10.15" in plugin.cfg
 
 Upstream is MIT licensed; see addon/LICENSE and NOTICE.
+
+`addon/patches/` holds fixes that are offered upstream and deliberately **not**
+applied to the tree above: `install.ps1` copies `addon/godot_mcp` verbatim, so
+the "unmodified copy" promise holds. Each patch records the file and the sha256
+it was cut from, and the test suite fails if the vendored file moves on without
+the patch being refreshed.

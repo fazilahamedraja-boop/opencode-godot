@@ -24,6 +24,35 @@ Workarounds:
 - keep `position`/`transform` values exactly representable (integers, `.5`, `.25`);
 - set awkward rotations from a script's `_ready()` instead of in a batch.
 
+**Fixed upstream?** No, not as of the vendored `2026.10.15`. This repo carries a
+verified patch instead:
+
+```
+addon/patches/0001-values-equal-float-components-with-epsilon.patch
+```
+
+It gives `values_equal` the same `epsilon` for `Vector2`/`Vector3`/`Vector4`,
+`Color`, `Rect2`, `Plane`, `Quaternion`, `Basis`, `Transform2D`/`Transform3D` and
+the packed float/vector/color arrays — while leaving ints, strings, sizes and
+genuinely different values exactly as strict as before. 32 headless cases on
+Godot 4.7.2: the proposal passes all 32, the vendored code gets **17** of them
+wrong, and nothing that should differ starts comparing equal.
+
+It is an **upstream proposal**: `install.ps1` copies `addon/godot_mcp` verbatim
+and never applies it, so the vendored tree stays pristine. To use it on your own
+installed copy (same command as verified, with your checkout in place of
+`<repo>`; run it from the config root, and note it refuses to apply twice):
+
+```powershell
+cd $env:USERPROFILE\.config\opencode
+git apply -p2 --directory=godot-mcp-addon <repo>\addon\patches\0001-values-equal-float-components-with-epsilon.patch
+```
+
+That is the *editor* verifier. The runtime probe keeps its own copy of this
+comparison (`mcp_runtime_probe.gd`, `_values_equal`) and this patch does not
+touch it: it drives change detection, not write verification, so a rounding
+difference there is a benign extra sample rather than a failed write.
+
 ## 2. Object-typed properties only accept a resource path
 
 `mesh`, `material_override`, `shape`, `environment` and friends accept **only** a

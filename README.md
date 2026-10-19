@@ -283,15 +283,17 @@ what lets it run with no Godot installed.
 It ends with an isolation audit: if anything under your real
 `~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
 the run fails (the stubs use private ports, which the audit does not watch). CI
-runs the same 30 tests on two clean Windows images (`windows-2022` and
+runs the same 31 tests on two clean Windows images (`windows-2022` and
 `windows-2025`), under both Windows PowerShell 5.1 and PowerShell 7.
 
-Two of those tests are worth knowing about. One drives the doctor with and
+Three of those tests are worth knowing about. One drives the doctor with and
 without an install record, with an edited install, with a checkout that has moved
 on, with a recorded checkout that is gone and with a corrupt record — asserting
-every time that drift is reported and the verdict does not move. The other pins
+every time that drift is reported and the verdict does not move. Another pins
 hashed-anywhere behaviour: by AST, no runtime script may call `Get-FileHash`
-(gotcha 12).
+(gotcha 12). The third holds the addon patch honest: it re-reads the sha256 the
+patch records for the file it was cut from, so bumping the vendored addon fails
+the suite until the patch is refreshed.
 
 ## Docs
 
@@ -308,3 +310,7 @@ The addon in `addon/godot_mcp/` is an unmodified copy of
 [Godot Editor MCP](https://github.com/hybridindie/godot-mcp) at `2026.10.15`,
 also MIT. The server is installed from PyPI rather than vendored. See
 [NOTICE](NOTICE).
+
+`addon/patches/` holds fixes offered upstream but deliberately not applied here,
+with the command to apply one to your own installed copy — see
+[gotcha 1](docs/gotchas.md).
