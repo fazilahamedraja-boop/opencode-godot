@@ -102,28 +102,101 @@ function Test-PortListening {
     return ($null -ne $c -and @($c).Count -gt 0)
 }
 
+function Split-GodotCommandLine {
+    # Split a Windows command line into tokens, keeping a quoted run together.
+    # Not a full CommandLineToArgvW: no backslash-escape processing, which Godot's
+    # own flags never need. Returns objects so a caller can tell a quoted argument
+    # (data) from a bare one (a flag or a value).
+    param([string]$CommandLine)
+    $tokens = @()
+    if (-not $CommandLine) { return $tokens }
+    foreach ($m in [regex]::Matches($CommandLine, '"([^"]*)"|(\S+)')) {
+        if ($m.Groups[1].Success) {
+            $tokens += [pscustomobject]@{ Value = $m.Groups[1].Value; Quoted = $true }
+        }
+        else {
+            $tokens += [pscustomobject]@{ Value = $m.Groups[2].Value; Quoted = $false }
+        }
+    }
+    return $tokens
+}
+
+function ConvertFrom-GodotCommandLine {
+    # Classify ONE command line. Returns $null when it is not a Godot run with
+    # --path at all, so the caller skips the process.
+    #
+    # Whole tokens, not substrings. The previous version matched '-e(ditor)?'
+    # after any whitespace, which had two consequences in opposite directions:
+    # a real editor started with '--editor' was NOT detected (the '-' before the
+    # 'e' is not whitespace), and a project path that merely contained ' -e '
+    # made a GAME look like an editor.
+    param([string]$CommandLine)
+
+    $tokens = Split-GodotCommandLine -CommandLine $CommandLine
+    if ($tokens.Count -eq 0) { return $null }
+
+    # --path <dir>, quoted or not. A quoted argument is one token, so a path with
+    # spaces stays a single value instead of being cut at the first space.
+    # '--path=<dir>' is deliberately not accepted: Godot takes the space form, and
+    # the old code did not accept the equals form either.
+    $projectPath = $null
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        if ($tokens[$i].Quoted) { continue }
+        if ($tokens[$i].Value -eq '--path' -and ($i + 1) -lt $tokens.Count) {
+            $projectPath = $tokens[$i + 1].Value
+            break
+        }
+    }
+    if ([string]::IsNullOrEmpty($projectPath)) { return $null }
+
+    # The three spellings Godot accepts, as standalone tokens. Quoted arguments
+    # are skipped so that text inside a path is never read as a flag.
+    $isEditor = $false
+    foreach ($t in $tokens) {
+        if ($t.Quoted) { continue }
+        if ($t.Value -eq '-e' -or $t.Value -eq '-editor' -or $t.Value -eq '--editor') {
+            $isEditor = $true
+            break
+        }
+    }
+
+    [pscustomobject]@{
+        ProjectPath = ($projectPath -replace '/', '\').TrimEnd('\')
+        IsEditor    = $isEditor
+    }
+}
+
+function Select-GodotHostProcess {
+    # Drop the launcher half of a console-build launch.
+    #
+    # Godot's *_console.exe is a launcher: it starts the real editor as its own
+    # child, so ONE window shows up as two processes. Dropping the launcher keeps
+    # the child, which is the process that owns the bridge socket. Matching on the
+    # name AND on having a child is what stops a normal (childless) console build,
+    # or the child of an F5 game run, from being mistaken for a launcher.
+    param([object[]]$Processes)
+    $kept = @()
+    foreach ($p in $Processes) {
+        if ($p.Name -match '_console') {
+            $children = @($Processes | Where-Object { $_.ParentProcessId -eq $p.ProcessId })
+            if ($children.Count -gt 0) { continue }
+        }
+        $kept += $p
+    }
+    return $kept
+}
+
 function Get-GodotEditors {
     # Every Godot process launched with --path, flagged as editor or game.
     $result = @()
     $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'Godot%'" -ErrorAction SilentlyContinue)
-    foreach ($p in $procs) {
-        $cl = $p.CommandLine
-        if (-not $cl) { continue }
-        if ($cl -notmatch '--path\s+(?:"([^"]+)"|(\S+))') { continue }
-        $path = $Matches[1]
-        if ([string]::IsNullOrEmpty($path)) { $path = $Matches[2] }
-        $isEditor = ($cl -match '\s-e(ditor)?(\s|$)')
-
-        # Godot's *_console.exe is a launcher: it starts the real editor as its own
-        # child, so ONE window shows up as two processes. Drop the launcher and keep
-        # the child - the child is the process that owns the bridge socket. Match on
-        # the name so the child of an F5 game run is never mistaken for a launcher.
-        if ($p.Name -match '_console' -and @($procs | Where-Object { $_.ParentProcessId -eq $p.ProcessId }).Count -gt 0) { continue }
-
+    foreach ($p in (Select-GodotHostProcess -Processes $procs)) {
+        $parsed = ConvertFrom-GodotCommandLine -CommandLine $p.CommandLine
+        if (-not $parsed) { continue }
         $result += [pscustomobject]@{
             OwnerPid    = $p.ProcessId
-            ProjectPath = ($path -replace '/', '\').TrimEnd('\')
-            IsEditor    = $isEditor
+            ProjectPath = $parsed.ProjectPath
+            IsEditor    = $parsed.IsEditor
         }
     }
     return $result
