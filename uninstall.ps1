@@ -34,11 +34,20 @@ function Say { param([string]$Text, [string]$Color = 'Gray') Write-Host $Text -F
 function Remove-Target {
     param([string]$Path, [string]$Label)
     if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Recurse -Force
-        Say ("  - {0}" -f $Label) 'Yellow'
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            Say ("  - {0}" -f $Label) 'Yellow'
+        }
+        catch {
+            # Never let a half-removed install look like a clean uninstall.
+            $script:failed++
+            Say ("  ! {0} - {1}" -f $Label, $_.Exception.Message) 'Red'
+        }
     }
     else { Say ("  = {0} (not installed)" -f $Label) }
 }
+
+$script:failed = 0
 
 Say ''
 Say 'opencode-godot uninstall' 'Cyan'
@@ -56,6 +65,7 @@ function Remove-EmptyDir {
 Say 'Files' 'Cyan'
 foreach ($s in @(
         'godot-ensure.ps1',
+        'godot-doctor.ps1',
         'godot-new-project.ps1',
         'godot-journal.ps1',
         'godot-mcp-service.cmd',
@@ -93,3 +103,9 @@ Say ''
 Say 'In opencode.json, delete this entry if you added it:' 'Yellow'
 Say '    "godot": { "type": "remote", "url": "http://127.0.0.1:9090/mcp" }' 'DarkGray'
 Say ''
+
+if ($script:failed -gt 0) {
+    Say ("{0} item(s) could not be removed - see the ! lines above." -f $script:failed) 'Red'
+    exit 1
+}
+exit 0
