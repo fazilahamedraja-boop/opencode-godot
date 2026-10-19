@@ -1,0 +1,10 @@
+godot-editor-mcp 2026.10.15
+https://github.com/hybridindie/godot-mcp/releases/tag/v2026.10.15
+
+The vendored addon in addon/godot_mcp is an unmodified copy of the upstream
+`godot/addons/godot_mcp` directory at that tag. Verify with:
+
+    Get-FileHash addon/godot_mcp/plugin.cfg
+    # version="2026.10.15" in plugin.cfg
+
+Upstream is MIT licensed; see addon/LICENSE and NOTICE.

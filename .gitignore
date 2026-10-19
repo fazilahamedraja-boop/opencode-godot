@@ -1,0 +1,14 @@
+# Local state a run of the tools can leave behind
+*.log
+last-project.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.bak
+*.bak-*
+
+# Never commit a config with credentials in it
+opencode.json

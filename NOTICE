@@ -1,0 +1,35 @@
+opencode-godot
+Copyright (c) 2026 Fazil Ahamed
+
+This project is MIT licensed (see LICENSE). It wires up, and redistributes, work
+by other people:
+
+-------------------------------------------------------------------------------
+Godot Editor MCP  -  https://github.com/hybridindie/godot-mcp
+-------------------------------------------------------------------------------
+License : MIT  (see addon/LICENSE)
+Version : 2026.10.15
+Vendored: addon/godot_mcp/  - an unmodified copy of the upstream addon
+          (godot/addons/godot_mcp at tag v2026.10.15)
+
+The MCP server itself is NOT vendored here. It is installed from PyPI as the
+`godot-editor-mcp` package, which is the same upstream project:
+
+    uv tool install godot-editor-mcp
+
+The scripts in scripts/ were written for this project, but exist because of that
+server and its documented transport model (one bridge connection, addon dials
+out and reconnects with backoff).
+
+-------------------------------------------------------------------------------
+Godot Engine  -  https://godotengine.org
+-------------------------------------------------------------------------------
+License : MIT
+Not redistributed here. You install the editor yourself.
+
+-------------------------------------------------------------------------------
+opencode  -  https://opencode.ai
+-------------------------------------------------------------------------------
+License : MIT
+Not redistributed here. The files under skill/ and command/ follow opencode's
+skill and command formats; they contain no opencode source code.
