@@ -111,3 +111,15 @@ changing `GODOT_MCP_HTTP_PORT` — the tools simply never appear, and nothing
 fails loudly. `godot-doctor.ps1` compares the two, and `install.ps1
 -PatchOpencode` rewrites the URL to the current port instead of reporting
 "already configured".
+
+## 11. MCP entries live one level down (`mcp.servers`)
+
+opencode's config schema keeps MCP servers under `mcp.servers`, and marks the flat
+`mcp.<name>` form `"deprecated": true` — but it still parses, so both shapes are in
+the wild. Reading only the flat form is what made the doctor report
+`opencode.json ... godot entry: MISSING` and exit `NOT READY` on a machine where the
+`godot` tools were working: the entry was there, one level down. `install.ps1` and
+`godot-doctor.ps1` read both, and `-PatchOpencode` puts the entry back into whichever
+shape the file already uses (a new file gets `mcp.servers`). If you move an entry by
+hand, put it in the same object as the other servers — an entry at the wrong depth is
+valid JSON that opencode never reads, and the doctor will say so.

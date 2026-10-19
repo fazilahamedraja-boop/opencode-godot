@@ -461,8 +461,12 @@ Test-Case 'install creates opencode.json when none exists' {
     $cfgFile = Join-Path $cfg 'opencode.json'
     Assert-Exists $cfgFile 'opencode.json was not created'
     $json = ConvertFrom-JsonFile $cfgFile
-    Assert-Equal 'remote' $json.mcp.godot.type 'the godot entry is not a remote server'
-    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the godot url did not follow GODOT_MCP_HTTP_PORT'
+    # Current shape: mcp.servers.<name>. The flat mcp.<name> form is deprecated
+    # in opencode's schema, so a config this installer creates must not use it.
+    Assert-Equal 'remote' $json.mcp.servers.godot.type 'the godot entry is not a remote server'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the godot url did not follow GODOT_MCP_HTTP_PORT'
+    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'the created mcp block should hold only "servers"'
+    Assert-Equal 'servers' (@($json.mcp.PSObject.Properties))[0].Name 'a new config must use the current mcp.servers shape'
     Assert-Match 'created with the "godot" remote server' $r.Output 'the installer never said it created the config'
     Assert-Missing "$cfgFile.bak-opencode-godot" 'a backup was written although there was nothing to back up'
 }
@@ -552,6 +556,127 @@ Test-Case 'an existing godot url on the wrong port is corrected' {
     $backup = "$cfgFile.bak-opencode-godot"
     Assert-Exists $backup 'the original config was not backed up'
     Assert-Equal $before (Get-Sha $backup) 'the backup is not byte-identical to the original'
+}
+
+Test-Case 'a current-shape config (mcp.servers) is patched where opencode reads it' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+
+    # opencode's current schema keeps servers under mcp.servers. A config in that
+    # shape must not be reported as unreadable, and the port fix has to land in
+    # the entry opencode actually reads - an extra entry under the deprecated
+    # flat key would be a silent duplicate.
+    $cfgFile = Join-Path $cfg 'opencode.json'
+    $original = @'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  "mcp": {
+    "servers": {
+      "github": { "type": "remote", "url": "https://api.githubcopilot.com/mcp/" },
+      "godot": { "type": "remote", "url": "http://127.0.0.1:9090/mcp" }
+    }
+  }
+}
+'@
+    [System.IO.File]::WriteAllText($cfgFile, $original, (New-Object System.Text.UTF8Encoding($false)))
+    $before = Get-Sha $cfgFile
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') `
+        -Environment (Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir))
+
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'updated "godot" -> http://127\.0\.0\.1:9599/mcp' $r.Output 'the port fix was not reported'
+    Assert-NotMatch 'cannot read' $r.Output 'a current-shape config was reported as unreadable'
+
+    $json = ConvertFrom-JsonFile $cfgFile
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the nested godot url was not corrected'
+    Assert-Equal 'https://api.githubcopilot.com/mcp/' $json.mcp.servers.github.url 'the github server was damaged'
+    Assert-Equal 2 (@($json.mcp.servers.PSObject.Properties)).Count 'a duplicate server entry appeared under servers'
+    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'a deprecated flat entry was created next to "servers"'
+    Assert-Equal 'tokyonight' $json.theme 'theme was not preserved'
+    Assert-NotMatch '9090' (Get-Content -LiteralPath $cfgFile -Raw) 'the old port is still in the config'
+
+    $backup = "$cfgFile.bak-opencode-godot"
+    Assert-Exists $backup 'the original config was not backed up'
+    Assert-Equal $before (Get-Sha $backup) 'the backup is not byte-identical to the original'
+}
+
+Test-Case 'a current-shape config without a godot entry gains one inside mcp.servers' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+
+    $cfgFile = Join-Path $cfg 'opencode.json'
+    $original = @'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "github": { "type": "remote", "url": "https://api.githubcopilot.com/mcp/" }
+    }
+  }
+}
+'@
+    [System.IO.File]::WriteAllText($cfgFile, $original, (New-Object System.Text.UTF8Encoding($false)))
+    $before = Get-Sha $cfgFile
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') `
+        -Environment (Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir))
+
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'added the "godot" remote server' $r.Output 'the entry was not added'
+
+    $json = ConvertFrom-JsonFile $cfgFile
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the entry did not land inside mcp.servers'
+    Assert-Equal 'https://api.githubcopilot.com/mcp/' $json.mcp.servers.github.url 'the github server was damaged'
+    Assert-Equal 2 (@($json.mcp.servers.PSObject.Properties)).Count 'the servers block should now hold two entries'
+    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'a deprecated flat entry was created next to "servers"'
+    Assert-Equal $before (Get-Sha "$cfgFile.bak-opencode-godot") 'the backup is not byte-identical to the original'
+}
+
+Test-Case 'a mcp block holding only options gains a servers object' {
+    param($dir)
+
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+    $cfg = Join-Path $dir 'cfg'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+
+    # The block is not empty (it carries the per-mcp timeout), so the entry has
+    # to be added as a new "servers" object beside it - not as a flat server,
+    # which the schema deprecates.
+    $cfgFile = Join-Path $cfg 'opencode.json'
+    $original = @'
+{
+  "mcp": {
+    "timeout": { "startup": 10000 }
+  }
+}
+'@
+    [System.IO.File]::WriteAllText($cfgFile, $original, (New-Object System.Text.UTF8Encoding($false)))
+
+    $r = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
+        -Arguments @('-ConfigRoot', $cfg, '-PatchOpencode', '-NoService', '-NoAutostart') `
+        -Environment (Get-InstallEnv -UserHome $fakeHome -ServerExe (New-StubServer -Dir $dir))
+
+    Assert-Equal 0 $r.ExitCode ("installer exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+    Assert-Match 'added the "godot" remote server' $r.Output 'the entry was not added'
+
+    $json = ConvertFrom-JsonFile $cfgFile
+    Assert-Equal 10000 $json.mcp.timeout.startup 'the existing mcp option was damaged'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the entry did not land under mcp.servers'
+    Assert-Equal 2 (@($json.mcp.PSObject.Properties)).Count 'mcp should hold "timeout" and "servers"'
+    Assert-NotMatch ',\s*\}' (Get-Content -LiteralPath $cfgFile -Raw) 'a trailing comma would break strict JSON parsers'
 }
 
 Test-Case 'without -PatchOpencode a wrong-port url is reported, not rewritten' {
@@ -915,7 +1040,7 @@ Test-Case 'a fresh profile installs to the default config root and can be cleane
     Assert-Exists (Join-Path $cfg 'godot-mcp-addon\godot_mcp\plugin.cfg') 'the addon was not installed'
 
     $json = ConvertFrom-JsonFile (Join-Path $cfg 'opencode.json')
-    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the default install points somewhere else'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the default install points somewhere else'
 
     # -NoAutostart must mean what it says, and nothing may leak into the profile.
     Assert-Missing (Join-Path $fakeHome 'godot-mcp-service.vbs') 'an autostart entry appeared despite -NoAutostart'
@@ -962,8 +1087,9 @@ Test-Case 'an empty mcp block gains the godot entry and stays valid JSON' {
 
     $json = ConvertFrom-JsonFile $cfgFile
     Assert-Equal 'tokyonight' $json.theme 'theme was not preserved'
-    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the godot entry is missing'
-    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'the empty mcp block gained more than one server'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the godot entry is missing'
+    Assert-Equal 1 (@($json.mcp.PSObject.Properties)).Count 'the empty mcp block gained more than one key'
+    Assert-Equal 'servers' (@($json.mcp.PSObject.Properties))[0].Name 'an empty mcp block should be filled with the current shape'
     Assert-NotMatch ',\s*\}' (Get-Content -LiteralPath $cfgFile -Raw) 'a trailing comma would break strict JSON parsers'
     Assert-Equal $before (Get-Sha "$cfgFile.bak-opencode-godot") 'the backup is not byte-identical to the original'
 }
@@ -1156,7 +1282,7 @@ Test-Case 'spaces, unicode and brackets in the config path are handled' {
     Assert-Equal (Get-Sha (Join-Path $RepoRoot "addon\godot_mcp\$nested")) (Get-Sha $installedNested) 'a nested addon file was copied incorrectly'
 
     $json = ConvertFrom-JsonFile (Join-Path $cfg 'opencode.json')
-    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.godot.url 'the url is wrong in that path'
+    Assert-Equal 'http://127.0.0.1:9599/mcp' $json.mcp.servers.godot.url 'the url is wrong in that path'
 
     # A second run must still recognise the addon as unchanged there.
     $again = Invoke-Og -Path (Join-Path $RepoRoot 'install.ps1') `
@@ -1485,16 +1611,20 @@ Test-Case 'doctor: READY, ALMOST and NOT READY, with service and bridge distinct
     $job = $null
     try {
         # Each case gets its own stub on its own port, so the URL the doctor
-        # validates and the service it talks to are the same thing.
+        # validates and the service it talks to are the same thing. The Shape
+        # field alternates the config layout: opencode's current mcp.servers and
+        # the older flat mcp.<name>, which the schema deprecates but still parses.
         $cases = @(
-            @{ Port = 9597; Attached = $false; Uv = $true;  Verdict = 'ALMOST';    Exit = 0 },
-            @{ Port = 9596; Attached = $true;  Uv = $true;  Verdict = 'READY';     Exit = 0 },
-            @{ Port = 9595; Attached = $true;  Uv = $false; Verdict = 'NOT READY'; Exit = 1 }
+            @{ Port = 9597; Attached = $false; Uv = $true;  Shape = 'servers'; Verdict = 'ALMOST';    Exit = 0 },
+            @{ Port = 9596; Attached = $true;  Uv = $true;  Shape = 'flat';    Verdict = 'READY';     Exit = 0 },
+            @{ Port = 9595; Attached = $true;  Uv = $false; Shape = 'servers'; Verdict = 'NOT READY'; Exit = 1 }
         )
         foreach ($case in $cases) {
-            $label = ("port {0}, editor attached {1}, uv present {2}" -f $case.Port, $case.Attached, $case.Uv)
+            $label = ("port {0}, editor attached {1}, uv present {2}, {3} shape" -f $case.Port, $case.Attached, $case.Uv, $case.Shape)
 
-            $json = @{ mcp = @{ godot = @{ type = 'remote'; url = "http://127.0.0.1:$($case.Port)/mcp" } } }
+            $godot = @{ type = 'remote'; url = "http://127.0.0.1:$($case.Port)/mcp" }
+            $json = if ($case.Shape -eq 'servers') { @{ mcp = @{ servers = @{ godot = $godot } } } }
+                    else { @{ mcp = @{ godot = $godot } } }
             [System.IO.File]::WriteAllText((Join-Path $cfg 'opencode.json'),
                 ($json | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -1521,6 +1651,12 @@ Test-Case 'doctor: READY, ALMOST and NOT READY, with service and bridge distinct
             # different facts, and the report has to keep them apart.
             Assert-Match ("service {0}\s+listening" -f $case.Port) $r.Output ("the service row is wrong for {0}" -f $label)
             Assert-Match ("bridge {0}\s+listening" -f $bridgePort) $r.Output ("the bridge-port row is wrong for {0}" -f $label)
+            # Both config shapes must be found, and a matching port must not be
+            # reported as a mismatch. Reading only the flat form reported
+            # "godot entry: MISSING" - and NOT READY - on a current config.
+            Assert-NotMatch 'godot entry: MISSING' $r.Output ("the godot entry was not found for {0}" -f $label)
+            Assert-Match ("-> http://127\.0\.0\.1:{0}/mcp" -f $case.Port) $r.Output ("the config url row is wrong for {0}" -f $label)
+            Assert-NotMatch '(?m)^\s+config port' $r.Output ("a matching port was reported as a mismatch for {0}" -f $label)
             Assert-Match 'server\s+godot-editor-mcp stub' $r.Output ("the MCP handshake did not happen for {0}" -f $label)
             if ($case.Attached) {
                 Assert-Match 'CONNECTED \(addon 2026\.10\.15\)' $r.Output ("the attached editor was not reported for {0}" -f $label)

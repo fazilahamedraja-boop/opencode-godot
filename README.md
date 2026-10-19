@@ -84,7 +84,7 @@ cd opencode-godot
 
 | flag | what it does |
 |---|---|
-| `-PatchOpencode` | adds the remote server to `opencode.json` (creates the file if you have none, backs up an existing one) |
+| `-PatchOpencode` | adds the remote server to `opencode.json` (creates the file if you have none, backs up an existing one, and follows the shape your file uses: `mcp.servers.godot`, or the older flat `mcp.godot`) |
 | `-InstallServer` | runs `uv tool install godot-editor-mcp` for you |
 | `-Verify` | probes the service and prints its version, tool count and bridge state |
 | `-NoAutostart` / `-NoService` | skip the logon shortcut / skip starting the service |
@@ -274,7 +274,7 @@ what lets it run with no Godot installed.
 It ends with an isolation audit: if anything under your real
 `~\.config\opencode`, the Startup entry, or the 9090/9080 listeners changed,
 the run fails (the stubs use private ports, which the audit does not watch). CI
-runs the same 24 tests on two clean Windows images (`windows-2022` and
+runs the same 27 tests on two clean Windows images (`windows-2022` and
 `windows-2025`), under both Windows PowerShell 5.1 and PowerShell 7.
 
 ## Docs

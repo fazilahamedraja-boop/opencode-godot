@@ -107,14 +107,19 @@ $cfg = Join-Path $configRoot 'opencode.json'
 if (Test-Path -LiteralPath $cfg) {
     try {
         $j = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
-        $hasGodot = $null -ne $j.mcp.godot
+        # opencode reads MCP servers from mcp.servers.<name>. The older flat
+        # mcp.<name> form is deprecated in the schema but still parsed, so both
+        # are honoured here - reading only the flat form made this row report
+        # "MISSING" (and NOT READY) on a config that was working fine.
+        $godotEntry = if ($j.mcp.servers.godot) { $j.mcp.servers.godot } else { $j.mcp.godot }
+        $hasGodot = $null -ne $godotEntry
         if (-not $hasGodot) {
             Row 'opencode.json' ("{0}  godot entry: MISSING" -f $cfg) $false
         }
         else {
             # The URL must point at the port the service is actually on, or
             # opencode connects to nothing and the tools silently never appear.
-            $url = [string]$j.mcp.godot.url
+            $url = [string]$godotEntry.url
             $cfgPort = 0
             if ($url -match ':(\d+)/') { $cfgPort = [int]$Matches[1] }
             $portOk = ($cfgPort -eq $servicePort)

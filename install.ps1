@@ -349,11 +349,45 @@ else {
 
 # ---------------------------------------------------------------- opencode.json
 
+function Get-GodotMcpEntry {
+    # opencode reads MCP servers from mcp.servers.<name>. The older flat
+    # mcp.<name> form is still parsed, but opencode's published config schema
+    # marks it deprecated ("deprecated": true) - and it is what an older
+    # opencode, or this installer before that changed, left in a config. Read
+    # both, so an entry the user already has is found wherever their file keeps
+    # it. Reading only the flat form made a current config look like it had no
+    # godot entry at all: the installer said "cannot read - check it by hand"
+    # and the doctor said "godot entry: MISSING" on a machine where the tools
+    # were working perfectly.
+    param($Config)
+    if (-not $Config) { return $null }
+    if ($Config.mcp.servers.godot) { return $Config.mcp.servers.godot }
+    if ($Config.mcp.godot) { return $Config.mcp.godot }
+    return $null
+}
+
+function Add-JsonEntry {
+    # Insert $Entry as the first key of the "$Name": { ... } object, handling the
+    # empty `{}` case (which must not gain a trailing comma).
+    param([string]$Text, [string]$Name, [string]$Entry, [string]$Indent, [string]$Close)
+    $empty = '"' + $Name + '"\s*:\s*\{\s*\}'
+    if ([regex]::IsMatch($Text, $empty)) {
+        return [regex]::Replace($Text, $empty, ('"' + $Name + '": {' + "`r`n" + $Indent + $Entry + "`r`n" + $Close), 1)
+    }
+    $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $m.Value + "`r`n" + $Indent + $Entry + ','
+    }
+    return [regex]::Replace($Text, '"' + $Name + '"\s*:\s*\{', $evaluator, 1)
+}
+
 $cfg = Join-Path $ConfigRoot 'opencode.json'
 $svcPort = if ($env:GODOT_MCP_HTTP_PORT) { $env:GODOT_MCP_HTTP_PORT } else { '9090' }
 $snippet = @"
   "mcp": {
-    "godot": { "type": "remote", "url": "http://127.0.0.1:$svcPort/mcp" }
+    "servers": {
+      "godot": { "type": "remote", "url": "http://127.0.0.1:$svcPort/mcp" }
+    }
   }
 "@
 
@@ -361,8 +395,9 @@ if (-not (Test-Path -LiteralPath $cfg)) {
     if ($PatchOpencode) {
         # A fresh opencode install usually has no opencode.json yet (it is created on
         # demand), so "patch" has to mean "create" here or the flag silently no-ops
-        # for exactly the people it is meant for.
-        $body = "{`r`n  `"mcp`": {`r`n    `"godot`": { `"type`": `"remote`", `"url`": `"http://127.0.0.1:$svcPort/mcp`" }`r`n  }`r`n}`r`n"
+        # for exactly the people it is meant for. Created in the current shape:
+        # mcp.servers.<name>, the form opencode's schema documents.
+        $body = "{`r`n  `"mcp`": {`r`n    `"servers`": {`r`n      `"godot`": { `"type`": `"remote`", `"url`": `"http://127.0.0.1:$svcPort/mcp`" }`r`n    }`r`n  }`r`n}`r`n"
         [System.IO.File]::WriteAllText($cfg, $body, (New-Object System.Text.UTF8Encoding($false)))
         Say ''
         Say 'opencode.json : created with the "godot" remote server' 'Green'
@@ -381,7 +416,11 @@ else {
         # never appear. Converge on the current port instead of no-oping.
         $target = "http://127.0.0.1:$svcPort/mcp"
         $current = $null
-        try { $current = (ConvertFrom-Json $raw).mcp.godot.url } catch { }
+        try {
+            $entryNode = Get-GodotMcpEntry -Config ($raw | ConvertFrom-Json)
+            if ($entryNode) { $current = [string]$entryNode.url }
+        }
+        catch { }
         if ($current -eq $target) {
             Say ''
             Say 'opencode.json : already has the "godot" MCP server' 'Green'
@@ -416,44 +455,71 @@ else {
         }
     }
     elseif ($PatchOpencode) {
-        $marker = '"mcp"\s*:\s*\{'
-        if ($raw -notmatch $marker) {
+        $target = "http://127.0.0.1:$svcPort/mcp"
+        $entry = '"godot": { "type": "remote", "url": "' + $target + '" }'
+        $parsedBefore = $null
+        try { $parsedBefore = $raw | ConvertFrom-Json } catch { }
+
+        # Which object gets the entry? Follow the file instead of migrating it:
+        #   * mcp.servers exists            -> add the entry inside it
+        #   * a flat mcp block with servers -> keep that file's shape
+        #   * neither (no mcp block, or one with only "timeout" in it)
+        #                                   -> add a mcp.servers object
+        # opencode still reads the flat form, but the schema marks it deprecated,
+        # so nothing new is ever created in it.
+        $hasServers = $false
+        $flatServers = 0
+        if ($parsedBefore -and $parsedBefore.mcp) {
+            $hasServers = $null -ne $parsedBefore.mcp.servers
+            $flatServers = @($parsedBefore.mcp.PSObject.Properties | Where-Object { $_.Name -ne 'timeout' }).Count
+        }
+
+        $out = $null
+        if ($hasServers) {
+            $out = Add-JsonEntry -Text $raw -Name 'servers' -Entry $entry -Indent '      ' -Close '    }'
+        }
+        elseif ($flatServers -gt 0) {
+            $out = Add-JsonEntry -Text $raw -Name 'mcp' -Entry $entry -Indent '    ' -Close '  }'
+        }
+        elseif ($raw -match '"mcp"\s*:\s*\{\s*\}') {
+            $body = '"mcp": {' + "`r`n    `"servers`": {" + "`r`n      " + $entry + "`r`n    }`r`n  }"
+            $out = [regex]::Replace($raw, '"mcp"\s*:\s*\{\s*\}', $body, 1)
+        }
+        elseif ($raw -match '"mcp"\s*:\s*\{') {
+            $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+                param($m)
+                $m.Value + "`r`n    `"servers`": {" + "`r`n      " + $entry + "`r`n    },"
+            }
+            $out = [regex]::Replace($raw, '"mcp"\s*:\s*\{', $evaluator, 1)
+        }
+
+        if ($null -eq $out) {
             Say ''
             Say 'opencode.json : no "mcp" block - add this by hand:' 'Yellow'
             Say $snippet 'DarkGray'
         }
         else {
-            Copy-Item -LiteralPath $cfg -Destination "$cfg.bak-opencode-godot" -Force
-
-            $entry = '"godot": { "type": "remote", "url": "http://127.0.0.1:' + $svcPort + '/mcp" }'
-            $parsedBefore = $null
-            try { $parsedBefore = $raw | ConvertFrom-Json } catch { }
-
-            if ([regex]::IsMatch($raw, '"mcp"\s*:\s*\{\s*\}')) {
-                # `"mcp": {}` - no trailing comma allowed
-                $raw = [regex]::Replace($raw, '"mcp"\s*:\s*\{\s*\}', ('"mcp": {' + "`r`n    " + $entry + "`r`n  }"), 1)
-            }
-            else {
-                $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
-                    param($m)
-                    $m.Value + "`r`n    " + $entry + ','
-                }
-                $raw = [regex]::Replace($raw, $marker, $evaluator, 1)
-            }
-
-            # If the config was valid JSON before the edit, it must still be valid after.
+            # Two things must hold before this is written: the result is still
+            # valid JSON, and opencode can actually find the entry where it was
+            # put. A regex insert into the wrong object would produce perfectly
+            # valid JSON that opencode never reads - so prove the read path.
             $ok = $true
             if ($parsedBefore) {
-                try { $null = $raw | ConvertFrom-Json } catch { $ok = $false }
+                try {
+                    $after = Get-GodotMcpEntry -Config ($out | ConvertFrom-Json)
+                    if (-not $after -or [string]$after.url -ne $target) { $ok = $false }
+                }
+                catch { $ok = $false }
             }
             if (-not $ok) {
-                Copy-Item -LiteralPath "$cfg.bak-opencode-godot" -Destination $cfg -Force
                 Say ''
-                Say 'opencode.json : patch would have produced invalid JSON - restored, edit by hand:' 'Red'
+                Say 'opencode.json : refusing to write - opencode would not find the entry, or the result would not be valid JSON' 'Red'
+                Say '                add this by hand:' 'Gray'
                 Say $snippet 'DarkGray'
             }
             else {
-                [System.IO.File]::WriteAllText($cfg, $raw, (New-Object System.Text.UTF8Encoding($false)))
+                Copy-Item -LiteralPath $cfg -Destination "$cfg.bak-opencode-godot" -Force
+                [System.IO.File]::WriteAllText($cfg, $out, (New-Object System.Text.UTF8Encoding($false)))
                 Say ''
                 Say 'opencode.json : added the "godot" remote server  (backup: .bak-opencode-godot)' 'Green'
             }
