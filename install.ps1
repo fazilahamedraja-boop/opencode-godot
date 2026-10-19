@@ -298,7 +298,17 @@ $installed = [ordered]@{}
 function Install-FileTracked {
     param([string]$From, [string]$To, [string]$Label, [string]$Rel)
     Install-File -From $From -To $To -Label $Label
-    $script:installed[$Rel] = Get-Sha256 -Path $To
+
+    # The checkout path is recorded, not assumed. The installed layout is not the
+    # checkout layout - skill\ installs to skills\, command\ to commands\ - so an
+    # installed path cannot be turned back into a source path by joining it onto
+    # the repo. Doing that made godot-doctor.ps1 call those two files drifted
+    # forever, on a clean install.
+    $src = $From.Substring($repo.Length).TrimStart('\').Replace('\', '/')
+    $script:installed[$Rel] = [ordered]@{
+        sha = (Get-Sha256 -Path $To)
+        src = $src
+    }
 }
 
 foreach ($s in @(
@@ -335,11 +345,17 @@ if (Test-Path -LiteralPath $recordPath) {
     try {
         $previous = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
         $old = @{}
-        foreach ($p in $previous.files.PSObject.Properties) { $old[$p.Name] = [string]$p.Value }
+        foreach ($p in $previous.files.PSObject.Properties) {
+            # A record written before the source path was kept holds a bare hash,
+            # so it can never compare equal to a signature that includes one: the
+            # record is rewritten once, which is the intent.
+            if ($p.Value -is [string]) { $old[$p.Name] = "$($p.Value)|" }
+            else { $old[$p.Name] = "$($p.Value.sha)|$($p.Value.src)" }
+        }
         $unchanged = ($old.Count -eq $installed.Count)
         if ($unchanged) {
             foreach ($key in $installed.Keys) {
-                if ($old[$key] -ne $installed[$key]) { $unchanged = $false; break }
+                if ($old[$key] -ne ("{0}|{1}" -f $installed[$key].sha, $installed[$key].src)) { $unchanged = $false; break }
             }
         }
     }

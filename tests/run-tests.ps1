@@ -845,7 +845,16 @@ Test-Case 'install records what it installed so drift can be spotted' {
     foreach ($prop in $j.files.PSObject.Properties) {
         $target = Join-Path $cfg ($prop.Name -replace '/', '\')
         Assert-Exists $target ("the record names a file that is not installed: {0}" -f $prop.Name)
-        Assert-Equal ([string]$prop.Value) (Get-Sha $target) ("the recorded hash is wrong for {0}" -f $prop.Name)
+        Assert-Equal ([string]$prop.Value.sha) (Get-Sha $target) ("the recorded hash is wrong for {0}" -f $prop.Name)
+
+        # The recorded source is what the doctor hashes to notice a checkout that
+        # has moved on, and the installed layout is not the checkout layout (skill\
+        # installs to skills\, command\ to commands\). Assuming the installed path
+        # could be joined back onto the repo made the doctor call two files drifted
+        # forever, so the contract is asserted here rather than assumed.
+        $src = Join-Path $RepoRoot ([string]$prop.Value.src -replace '/', '\')
+        Assert-Exists $src ("{0} records a source that is not in the checkout: {1}" -f $prop.Name, $prop.Value.src)
+        Assert-Equal ([string]$prop.Value.sha) (Get-Sha $src) ("{0} records a source whose content is not what was installed" -f $prop.Name)
     }
     Assert-True ($names -contains 'scripts/godot-doctor.ps1') 'the doctor is not in the record'
     Assert-True ($names -contains 'commands/game.md') 'the command is not in the record'
@@ -1822,8 +1831,10 @@ Test-Case 'doctor: an install record is checked, and drift never fails the box' 
         Assert-Match '(?m)^  ALMOST' $r.Output 'an install without a record is not ALMOST'
         Assert-Match 'no install record' $r.Output 'the missing record was not mentioned'
 
-        # 2. In sync: reported, with no drift hint.
-        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'; files = @{ 'scripts/godot-ensure.ps1' = (Get-Sha $installedFile) } } |
+        # 2. In sync: reported, with no drift hint. Each entry carries the source
+        #    path in the checkout, which is what the second half hashes.
+        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'
+           files = @{ 'scripts/godot-ensure.ps1' = @{ sha = (Get-Sha $installedFile); src = 'scripts/godot-ensure.ps1' } } } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
         $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
         Assert-Equal 0 $r.ExitCode ("the doctor exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
@@ -1831,6 +1842,20 @@ Test-Case 'doctor: an install record is checked, and drift never fails the box' 
         Assert-Match 'all files as installed' $r.Output 'an in-sync install was not recognised'
         Assert-NotMatch '(?m)^\s+drift' $r.Output 'drift was reported on an in-sync install'
         Assert-Match '(?m)^  ALMOST' $r.Output 'an in-sync install is not ALMOST'
+
+        # 2b. A record from before source paths were kept holds a bare hash, so the
+        #     checkout half cannot be checked. Saying nothing would hide it and
+        #     calling it drift would be a lie, so it is reported as neither.
+        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'; files = @{ 'scripts/godot-ensure.ps1' = (Get-Sha $installedFile) } } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("the doctor exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-Match 'predate recorded source paths' $r.Output 'a legacy record was silently skipped'
+        Assert-NotMatch 'run install\.cmd to update' $r.Output 'a legacy record was reported as checkout drift'
+        #    ...then back to the current shape, because the cases below build on it.
+        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'
+           files = @{ 'scripts/godot-ensure.ps1' = @{ sha = (Get-Sha $installedFile); src = 'scripts/godot-ensure.ps1' } } } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
 
         # 3. The installed file was edited here: reported, and still not a failure.
         [System.IO.File]::AppendAllText($installedFile, "# local edit`n")
@@ -1847,7 +1872,31 @@ Test-Case 'doctor: an install record is checked, and drift never fails the box' 
         Assert-Match '1 edited here' $r.Output 'the local edit stopped being reported'
         Assert-Match '(?m)^  ALMOST' $r.Output 'a moved-on checkout is not ALMOST'
 
-        # 5. A recorded checkout that is gone: explained, not a crash (the repo a
+        # 5. The installed layout is not the checkout layout: skill\ installs to
+        #    skills\ and command\ to commands\, so a checkout path cannot be built
+        #    by joining the installed path. Assuming it could made the doctor call
+        #    those files drifted forever, on a clean install.
+        New-Item -ItemType Directory -Force -Path (Join-Path $cfg 'commands'), (Join-Path $checkout 'command') | Out-Null
+        $installedCmd = Join-Path $cfg 'commands\game.md'
+        $checkoutCmd = Join-Path $checkout 'command\game.md'
+        [System.IO.File]::WriteAllText($installedCmd, "installed copy`n")
+        [System.IO.File]::WriteAllText($checkoutCmd, "installed copy`n")
+        @{ repo = $checkout; installedAt = '2026-01-01T00:00:00Z'
+           files = @{ 'commands/game.md' = @{ sha = (Get-Sha $installedCmd); src = 'command/game.md' } } } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Equal 0 $r.ExitCode ("the doctor exited {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))
+        Assert-NotMatch '(?m)^\s+drift' $r.Output 'a file whose checkout path differs from its installed path was called drift'
+        Assert-Match 'all files as installed' $r.Output 'the mapped file was not recognised as in sync'
+
+        # ...and a real change to that same file is still caught - and named, since
+        #    a bare count is what made this bug invisible in the first place.
+        [System.IO.File]::AppendAllText($checkoutCmd, "# newer in the checkout`n")
+        $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
+        Assert-Match 'run install\.cmd to update' $r.Output 'a moved-on checkout stopped being reported'
+        Assert-Match 'commands/game\.md' $r.Output 'the drifting file was not named'
+
+        # 6. A recorded checkout that is gone: explained, not a crash (the repo a
         #    user installed from can be moved or deleted without breaking the box).
         @{ repo = (Join-Path $dir 'gone'); installedAt = '2026-01-01T00:00:00Z'; files = @{ 'scripts/godot-ensure.ps1' = (Get-Sha $installedFile) } } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $record -Encoding ASCII
@@ -1856,7 +1905,7 @@ Test-Case 'doctor: an install record is checked, and drift never fails the box' 
         Assert-Match 'not there any more' $r.Output 'a missing checkout was not explained'
         Assert-NotMatch 'At line:|CategoryInfo' $r.Output 'the doctor crashed on a missing checkout'
 
-        # 6. A corrupt record: reported, still not a crash, still not a failure.
+        # 7. A corrupt record: reported, still not a crash, still not a failure.
         [System.IO.File]::WriteAllText($record, '{ this is not json')
         $r = Invoke-Og -Path $doctor -Arguments @('-TimeoutSec', '5') -Environment $envMap
         Assert-Equal 0 $r.ExitCode ("a corrupt record must not fail the box, got {0}: {1}" -f $r.ExitCode, (Get-Tail $r.Output))

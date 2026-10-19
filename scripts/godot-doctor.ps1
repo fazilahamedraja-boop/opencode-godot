@@ -178,7 +178,15 @@ if (Test-Path -LiteralPath $recordPath) {
             param($Record)
             # Empty (or unreadable) "files" must yield nothing, not throw.
             if (-not $Record -or -not $Record.files) { return @() }
-            $Record.files.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Rel = $_.Name; Sha = [string]$_.Value } }
+            $Record.files.PSObject.Properties | ForEach-Object {
+                # "files" holds { sha, src }. A record written before the source
+                # path was kept holds a bare hash, and then the checkout half
+                # cannot be checked at all - which is not the same as drift.
+                $sha = [string]$_.Value
+                $src = ''
+                if ($_.Value -isnot [string]) { $sha = [string]$_.Value.sha; $src = [string]$_.Value.src }
+                [pscustomobject]@{ Rel = $_.Name; Sha = $sha; Src = $src }
+            }
         }
 
         $recorded = @(Get-RecordedFiles -Record $record)
@@ -191,13 +199,24 @@ if (Test-Path -LiteralPath $recordPath) {
         }
 
         $repoMoved = 0
+        $uncheckable = 0
+        $movedNames = @()
         $repoPresent = $false
         if ($sourceRepo) { $repoPresent = Test-Path -LiteralPath $sourceRepo }
         if ($repoPresent) {
             foreach ($item in $recorded) {
-                $src = Join-Path $sourceRepo ($item.Rel -replace '/', '\')
-                if (-not (Test-Path -LiteralPath $src)) { $repoMoved++; continue }
-                if ((Get-Sha256 -Path $src) -ne $item.Sha) { $repoMoved++ }
+                # Compare against the recorded source, never against the installed
+                # path: skill\ installs to skills\ and command\ to commands\, so a
+                # join would look in the wrong place and report drift that is not
+                # there - forever, on a clean install.
+                if (-not $item.Src) { $uncheckable++; continue }
+                $src = Join-Path $sourceRepo ($item.Src -replace '/', '\')
+                $differs = $true
+                if (Test-Path -LiteralPath $src) { $differs = ((Get-Sha256 -Path $src) -ne $item.Sha) }
+                if ($differs) {
+                    $repoMoved++
+                    if ($movedNames.Count -lt 5) { $movedNames += $item.Rel }
+                }
             }
         }
 
@@ -209,7 +228,15 @@ if (Test-Path -LiteralPath $recordPath) {
         Row 'install' ("{0}  ({1})" -f $source, ($facts -join ', '))
 
         if ($repoMoved) {
+            # Naming them is the difference between a number and a fix: the
+            # "installed layout is not the checkout layout" bug was a permanent
+            # false drift and the report did not even say which file it meant.
+            $more = if ($movedNames.Count -lt $repoMoved) { ', ...' } else { '' }
             Row '   drift' ("{0} file(s) in the checkout differ from this install - run install.cmd to update" -f $repoMoved)
+            Row '' ("      " + ($movedNames -join ', ') + $more)
+        }
+        if ($uncheckable) {
+            Row '   drift' ("{0} file(s) predate recorded source paths - re-run install.cmd to check them" -f $uncheckable)
         }
         if (-not $repoPresent) {
             Row '   drift' 'the recorded checkout is not there any more - update checks skipped (re-run install.cmd to re-record)'
